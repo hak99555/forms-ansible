@@ -1,0 +1,6 @@
+---
+# Copy to vault.yml, fill in values, and encrypt with ansible-vault.
+vault_fr_db_password: ''
+vault_fr_schema_password: ''
+vault_fr_admin_password: ''
+vault_fr_nm_password: ''

@@ -1,0 +1,1056 @@
+# All deployment tasks and generated sources are inline in this playbook.
+---
+- name: Configure Oracle Forms Reports domain and optional OHS
+  hosts: forms_reports
+  become: true
+  gather_facts: true
+  serial: 1
+  any_errors_fatal: true
+  pre_tasks:
+  - name: Validate platform and deployment settings
+    ansible.builtin.assert:
+      that:
+      - not ansible_check_mode
+      - ansible_distribution == 'OracleLinux'
+      - ansible_architecture == 'x86_64'
+      - (ansible_distribution_major_version == '8' and ansible_distribution_version is version('8.6', '>=')) or
+        (ansible_distribution_major_version == '9' and ansible_distribution_version is version('9.2', '>='))
+      - fr_version == '14.1.2.0.0'
+      - fr_media_location in ['target', 'controller']
+      - fr_domain_name is match('^[A-Za-z][A-Za-z0-9_]*$')
+      - fr_os_user is match('^[a-z_][a-z0-9_-]*$')
+      - fr_os_group is match('^[a-z_][a-z0-9_-]*$')
+      - fr_rcu_prefix is match('^[A-Z][A-Z0-9]{0,11}$')
+      - fr_forms_count | int >= 1
+      - fr_reports_count | int >= 1
+      - fr_admin_address == '127.0.0.1'
+      - fr_nm_address == '127.0.0.1'
+      - fr_listen_address is match('^[A-Za-z0-9][A-Za-z0-9.-]*$')
+      - fr_admin_xms_mb | int > 0
+      - fr_admin_xmx_mb | int >= fr_admin_xms_mb | int
+      - fr_forms_xms_mb | int > 0
+      - fr_forms_xmx_mb | int >= fr_forms_xms_mb | int
+      - fr_reports_xms_mb | int > 0
+      - fr_reports_xmx_mb | int >= fr_reports_xms_mb | int
+      - fr_reports_min_engine | int >= 0
+      - fr_reports_init_engine | int >= fr_reports_min_engine | int
+      - fr_reports_max_engine | int >= fr_reports_init_engine | int
+      - fr_reports_max_engine | int > 0
+      - ansible_memtotal_mb | int >= fr_min_memory_mb | int
+      fail_msg: Requires Oracle Linux x86_64 8.6+ or 9.2+, valid parameters and sufficient RAM. Check mode cannot
+        simulate Oracle installers/WLST; use --syntax-check.
+    tags:
+    - parameters
+  - name: Validate filesystem paths
+    ansible.builtin.assert:
+      that:
+      - item is match('^/[A-Za-z0-9_./-]+$')
+      - '''..'' not in item.split(''/'')'
+      - item != '/'
+    loop:
+    - '{{ fr_os_home }}'
+    - '{{ fr_oracle_base }}'
+    - '{{ fr_oracle_home }}'
+    - '{{ fr_inventory_home }}'
+    - '{{ fr_inventory_pointer }}'
+    - '{{ fr_stage }}'
+    - '{{ fr_state }}'
+    - '{{ fr_domain_home }}'
+    - '{{ fr_application_home }}'
+    - '{{ fr_log_home }}'
+    - '{{ fr_java_parent }}'
+    - '{{ fr_java_home }}'
+    tags:
+    - parameters
+  - name: Require distinct RCU prefixes for hosts sharing a repository database
+    ansible.builtin.assert:
+      that:
+      - hostvars[item].fr_db_connect != fr_db_connect or hostvars[item].fr_rcu_prefix != fr_rcu_prefix
+      fail_msg: Each independent domain on the same database needs a unique RCU prefix. Set host_vars overrides.
+    loop: '{{ ansible_play_hosts_all }}'
+    when: item != inventory_hostname
+    tags:
+    - parameters
+  - name: Validate names used by Oracle and systemd
+    ansible.builtin.assert:
+      that:
+      - item is match('^[A-Za-z][A-Za-z0-9_]*$')
+    loop:
+    - '{{ fr_machine_name }}'
+    - '{{ fr_forms_cluster }}'
+    - '{{ fr_reports_cluster }}'
+    - '{{ fr_forms_server_prefix }}'
+    - '{{ fr_reports_server_prefix }}'
+    - '{{ fr_reports_component_prefix }}'
+    - '{{ fr_reports_tools_name }}'
+    - '{{ fr_ohs_name }}'
+    tags:
+    - parameters
+  - name: Validate layout and JVM shell values
+    ansible.builtin.assert:
+      that:
+      - not fr_domain_home.startswith(fr_oracle_home + '/')
+      - fr_domain_home != fr_oracle_home
+      - fr_java_home == fr_java_parent + '/' + fr_jdk_directory
+      - fr_forms_cluster != fr_reports_cluster
+      - fr_forms_server_prefix != fr_reports_server_prefix
+      - fr_jdk_directory is match('^[A-Za-z0-9_.-]+$')
+      - item is match('^[A-Za-z0-9_ ./,:=+%-]*$')
+    loop:
+    - '{{ fr_jvm_common }}'
+    - '{{ fr_admin_jvm_extra }}'
+    - '{{ fr_forms_jvm_extra }}'
+    - '{{ fr_reports_jvm_extra }}'
+    - '{{ fr_reports_engine_jvm }}'
+    tags:
+    - parameters
+  - name: Initialize derived lists
+    ansible.builtin.set_fact:
+      fr_servers: []
+      fr_native_components: []
+      fr_ports:
+      - '{{ fr_admin_port | int }}'
+      - '{{ fr_nm_port | int }}'
+      fr_environment:
+        JAVA_HOME: '{{ fr_java_home }}'
+        ORACLE_HOME: '{{ fr_oracle_home }}'
+        MW_HOME: '{{ fr_oracle_home }}'
+        DOMAIN_HOME: '{{ fr_domain_home }}'
+        PATH: '{{ fr_java_home }}/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+        LANG: C.UTF-8
+    tags:
+    - parameters
+  - name: Derive Forms managed servers
+    ansible.builtin.set_fact:
+      fr_servers: '{{ fr_servers + [{''name'': fr_forms_server_prefix ~ item, ''port'': (fr_forms_port_base | int
+        + item | int - 1), ''kind'': ''forms''}] }}'
+      fr_ports: '{{ fr_ports + [fr_forms_port_base | int + item | int - 1] }}'
+    loop: '{{ range(1, fr_forms_count | int + 1) | list }}'
+    tags:
+    - parameters
+  - name: Derive Reports managed servers and native servers
+    ansible.builtin.set_fact:
+      fr_servers: '{{ fr_servers + [{''name'': fr_reports_server_prefix ~ item, ''port'': (fr_reports_port_base
+        | int + item | int - 1), ''kind'': ''reports''}] }}'
+      fr_native_components: '{{ fr_native_components + [{''name'': fr_reports_component_prefix ~ item, ''type'':
+        ''ReportsServerComponent''}] }}'
+      fr_ports: '{{ fr_ports + [fr_reports_port_base | int + item | int - 1] }}'
+    loop: '{{ range(1, fr_reports_count | int + 1) | list }}'
+    tags:
+    - parameters
+  - name: Include optional OHS ports and component
+    ansible.builtin.set_fact:
+      fr_ports: '{{ fr_ports + [fr_ohs_port | int, fr_ohs_ssl_port | int, fr_ohs_admin_port | int] }}'
+      fr_native_components: '{{ fr_native_components + [{''name'': fr_ohs_name, ''type'': ''OHS''}] }}'
+    when: fr_ohs_enabled | bool
+    tags:
+    - parameters
+  - name: Validate unique unprivileged listeners
+    ansible.builtin.assert:
+      that:
+      - fr_ports | map('int') | unique | list | length == fr_ports | length
+      - fr_ports | map('int') | min >= 1024
+      - fr_ports | map('int') | max <= 65535
+      - fr_servers | map(attribute='name') | unique | list | length == fr_servers | length
+      - fr_native_components | map(attribute='name') | unique | list | length == fr_native_components | length
+      - fr_reports_tools_name not in (fr_native_components | map(attribute='name') | list)
+    tags:
+    - parameters
+  - name: Build public domain configuration
+    ansible.builtin.set_fact:
+      fr_domain_config:
+        version: '{{ fr_version }}'
+        domain_name: '{{ fr_domain_name }}'
+        domain_home: '{{ fr_domain_home }}'
+        oracle_home: '{{ fr_oracle_home }}'
+        java_home: '{{ fr_java_home }}'
+        application_home: '{{ fr_application_home }}'
+        listen_address: '{{ fr_listen_address }}'
+        admin_address: '{{ fr_admin_address }}'
+        admin_port: '{{ fr_admin_port | int }}'
+        admin_user: '{{ fr_admin_user }}'
+        nm_address: '{{ fr_nm_address }}'
+        nm_port: '{{ fr_nm_port | int }}'
+        nm_user: '{{ fr_nm_user }}'
+        machine: '{{ fr_machine_name }}'
+        templates: '{{ fr_templates + ([''Oracle HTTP Server (Colocated)''] if fr_ohs_enabled | bool else []) }}'
+        jdbc_url: '{{ fr_db_jdbc_url }}'
+        rcu_prefix: '{{ fr_rcu_prefix }}'
+        servers: '{{ fr_servers }}'
+        forms_cluster: '{{ fr_forms_cluster }}'
+        reports_cluster: '{{ fr_reports_cluster }}'
+        forms_groups: '{{ fr_forms_server_groups }}'
+        reports_groups: '{{ fr_reports_server_groups }}'
+        tools_name: '{{ fr_reports_tools_name }}'
+        components: '{{ fr_native_components }}'
+        ohs_enabled: '{{ fr_ohs_enabled | bool }}'
+        ohs_name: '{{ fr_ohs_name }}'
+        ohs_port: '{{ fr_ohs_port | int }}'
+        ohs_ssl_port: '{{ fr_ohs_ssl_port | int }}'
+        ohs_admin_port: '{{ fr_ohs_admin_port | int }}'
+        ohs_server_name: '{{ fr_ohs_server_name }}'
+        timeout: '{{ fr_start_timeout | int }}'
+        stop_timeout: '{{ fr_stop_timeout | int }}'
+        tuning:
+          admin_heap: '{{ [fr_admin_xms_mb, fr_admin_xmx_mb] }}'
+          forms_heap: '{{ [fr_forms_xms_mb, fr_forms_xmx_mb] }}'
+          reports_heap: '{{ [fr_reports_xms_mb, fr_reports_xmx_mb] }}'
+          jvm: '{{ [fr_jvm_common, fr_admin_jvm_extra, fr_forms_jvm_extra, fr_reports_jvm_extra] }}'
+          engine: '{{ [fr_reports_min_engine, fr_reports_init_engine, fr_reports_max_engine, fr_reports_engine_life,
+            fr_reports_engine_max_idle, fr_reports_engine_jvm] }}'
+          proxy_timeout: '{{ fr_proxy_timeout }}'
+    tags:
+    - parameters
+  - name: Compute immutable domain identity
+    ansible.builtin.set_fact:
+      fr_domain_identity: '{{ fr_domain_config | to_json(sort_keys=True) | hash("sha256") }}'
+    tags:
+    - parameters
+  tasks:
+  - name: Configure under an exclusive deployment lock
+    block:
+    - name: Acquire deployment lock
+      become_user: '{{ fr_os_user }}'
+      ansible.builtin.command:
+        argv:
+        - /usr/bin/mkdir
+        - '{{ fr_state }}/deployment.lock'
+      register: fr_lock
+      changed_when: true
+    - name: Inspect installed middleware and domain state
+      ansible.builtin.stat:
+        path: '{{ item }}'
+      register: fr_config_state
+      loop:
+      - '{{ fr_oracle_home }}/oracle_common/common/bin/wlst.sh'
+      - '{{ fr_state }}/forms_reports.complete'
+      - '{{ fr_domain_home }}'
+      - '{{ fr_state }}/domain.complete'
+      - '{{ fr_state }}/domain.started'
+    - name: Read domain identity if already provisioned
+      ansible.builtin.slurp:
+        src: '{{ fr_state }}/domain.complete'
+      register: fr_existing_domain
+      when: fr_config_state.results[3].stat.exists
+    - name: Require installed binaries and unchanged managed domain
+      ansible.builtin.assert:
+        that:
+        - fr_config_state.results[0].stat.exists
+        - fr_config_state.results[1].stat.exists
+        - not fr_config_state.results[2].stat.exists or fr_config_state.results[3].stat.exists
+        - not fr_config_state.results[3].stat.exists or fr_config_state.results[2].stat.exists
+        - not fr_config_state.results[4].stat.exists or fr_config_state.results[3].stat.exists
+        - not fr_config_state.results[3].stat.exists or (fr_existing_domain.content | default('') | b64decode |
+          trim) == fr_domain_identity
+        fail_msg: Run install_middleware.yml first. Existing partial domains or changed parameters require a controlled
+          maintenance procedure.
+    - name: Require configuration credentials
+      ansible.builtin.assert:
+        that:
+        - vault_fr_admin_password | default('') | length >= 12
+        - vault_fr_nm_password | default('') | length >= 12
+        - vault_fr_schema_password | default('') | length >= 12
+        - not fr_rcu_create | bool or vault_fr_db_password | default('') | length > 0
+      no_log: true
+    - name: Reject multiline credentials
+      ansible.builtin.assert:
+        that:
+        - |-
+          '
+          ' not in item
+        - "'\r' not in item"
+      loop:
+      - '{{ vault_fr_admin_password }}'
+      - '{{ vault_fr_nm_password }}'
+      - '{{ vault_fr_schema_password }}'
+      - '{{ vault_fr_db_password | default('''') }}'
+      no_log: true
+    - name: Create protected configuration input
+      ansible.builtin.copy:
+        dest: '{{ fr_state }}/secrets/configure.json'
+        content: '{{ fr_domain_config | combine({''admin_password'': vault_fr_admin_password, ''nm_password'': vault_fr_nm_password,
+          ''schema_password'': vault_fr_schema_password}) | to_json }}'
+        owner: '{{ fr_os_user }}'
+        group: '{{ fr_os_group }}'
+        mode: '0600'
+      no_log: true
+    - name: Write embedded Oracle WLST program create_domain.py
+      ansible.builtin.copy:
+        dest: '{{ fr_state }}/scripts/create_domain.py'
+        owner: '{{ fr_os_user }}'
+        group: '{{ fr_os_group }}'
+        mode: '0600'
+        content: |
+          # Oracle WLST / Jython 2.7. Executed only by Ansible, with JSON input.
+          import json
+          import os
+          import sys
+          import traceback
+          from java.io import FileOutputStream
+          from java.util import Properties
+
+
+          def properties(path, values):
+              parent = os.path.dirname(path)
+              if not os.path.isdir(parent):
+                  os.makedirs(parent, 0o700)
+              p = Properties()
+              for key, value in values.items():
+                  p.setProperty(key, value)
+              stream = FileOutputStream(path)
+              try:
+                  p.store(stream, 'Initial boot identity; WebLogic encrypts on startup')
+              finally:
+                  stream.close()
+              os.chmod(path, 0o600)
+
+
+          def main(c):
+              if os.path.exists(c['domain_home']):
+                  raise RuntimeError('Refusing to overwrite an existing domain')
+              for template in c['templates']:
+                  selectTemplate(template, c['version'])
+              loadTemplates()
+              cd('/')
+              original_name = cmo.getName()
+              cd('/Security/' + original_name + '/User/weblogic')
+              set('Name', c['admin_user'])
+              set('Password', c['admin_password'])
+              setOption('DomainName', c['domain_name'])
+              setOption('JavaHome', c['java_home'])
+              setOption('ServerStartMode', 'prod')
+              setOption('AppDir', c['application_home'])
+              setOption('NodeManagerType', 'PerDomainNodeManager')
+              setOption('OverwriteDomain', 'false')
+              cd('/')
+              set('Name', c['domain_name'])
+              create(c['machine'], 'UnixMachine')
+              cd('/Machines/' + c['machine'])
+              create(c['machine'], 'NodeManager')
+              cd('/Machines/%s/NodeManager/%s' % (c['machine'], c['machine']))
+              set('ListenAddress', c['nm_address'])
+              set('ListenPort', int(c['nm_port']))
+              set('NMType', 'Plain')
+              cd('/Servers/AdminServer')
+              set('ListenAddress', c['admin_address'])
+              set('ListenPort', int(c['admin_port']))
+              set('Machine', c['machine'])
+
+              jdbc = '/JDBCSystemResource/LocalSvcTblDataSource/JdbcResource/LocalSvcTblDataSource/JDBCDriverParams/NO_NAME_0'
+              cd(jdbc)
+              set('DriverName', 'oracle.jdbc.OracleDriver')
+              set('URL', c['jdbc_url'])
+              set('PasswordEncrypted', c['schema_password'])
+              cd('Properties/NO_NAME_0/Property/user')
+              set('Value', c['rcu_prefix'] + '_STB')
+              getDatabaseDefaults()
+              cd('/JDBCSystemResource')
+              for name in list(ls(returnMap='true').keys()):
+                  cd('/JDBCSystemResource/%s/JdbcResource/%s/JDBCDriverParams/NO_NAME_0' % (name, name))
+                  set('PasswordEncrypted', c['schema_password'])
+
+              for kind, template_server in [('forms', 'WLS_FORMS'), ('reports', 'WLS_REPORTS')]:
+                  cluster = c[kind + '_cluster']
+                  servers = [s for s in c['servers'] if s['kind'] == kind]
+                  cd('/')
+                  create(cluster, 'Cluster')
+                  cd('/Clusters/' + cluster)
+                  set('ClusterMessagingMode', 'unicast')
+                  set('ClusterAddress', ','.join('%s:%s' % (c['listen_address'], s['port']) for s in servers))
+                  set('WeblogicPluginEnabled', bool(c['ohs_enabled']))
+                  cd('/Servers/' + template_server)
+                  set('Name', servers[0]['name'])
+                  for index, server in enumerate(servers):
+                      name = server['name']
+                      if index > 0:
+                          cd('/')
+                          create(name, 'Server')
+                      cd('/Servers/' + name)
+                      set('ListenAddress', c['listen_address'])
+                      set('ListenPort', int(server['port']))
+                      set('Machine', c['machine'])
+                      set('Cluster', cluster)
+                      # Oracle server groups materialize product-specific deployments and
+                      # per-server configuration for EVERY additional Managed Server.
+                      setServerGroups(name, c[kind + '_groups'])
+              cd('/SecurityConfiguration/' + c['domain_name'])
+              set('NodeManagerUsername', c['nm_user'])
+              set('NodeManagerPasswordEncrypted', c['nm_password'])
+              writeDomain(c['domain_home'])
+              closeDomain()
+              for name in ['AdminServer'] + [s['name'] for s in c['servers']]:
+                  properties(os.path.join(c['domain_home'], 'servers', name, 'security', 'boot.properties'),
+                             {'username': c['admin_user'], 'password': c['admin_password']})
+              print('FR_DOMAIN_CREATED')
+
+
+          try:
+              with open(sys.argv[1], 'r') as source:
+                  main(json.load(source))
+          except:
+              traceback.print_exc()
+              exit(exitcode=1)
+          exit(exitcode=0)
+    - name: Write embedded Oracle WLST program runtime.py
+      ansible.builtin.copy:
+        dest: '{{ fr_state }}/scripts/runtime.py'
+        owner: '{{ fr_os_user }}'
+        group: '{{ fr_os_group }}'
+        mode: '0600'
+        content: |
+          # Oracle WLST / Jython 2.7. Programs contain no embedded credentials.
+          import json
+          import sys
+          import time
+          import traceback
+
+
+          def connect_admin(c):
+              deadline = time.time() + int(c['timeout'])
+              while True:
+                  try:
+                      connect(c['admin_user'], c['admin_password'],
+                              't3://%s:%s' % (c['admin_address'], c['admin_port']), timeout=10000)
+                      return
+                  except:
+                      if time.time() >= deadline:
+                          raise
+                      time.sleep(5)
+
+
+          def connect_nm(c):
+              nmConnect(c['nm_user'], c['nm_password'], c['nm_address'], str(c['nm_port']),
+                        c['domain_name'], c['domain_home'], 'plain')
+
+
+          def wait_server(c, name):
+              domainRuntime()
+              deadline = time.time() + int(c['timeout'])
+              while time.time() < deadline:
+                  cd('/ServerLifeCycleRuntimes/' + name)
+                  current = cmo.getState()
+                  if current == 'RUNNING':
+                      return
+                  if current in ['FAILED', 'FAILED_NOT_RESTARTABLE']:
+                      raise RuntimeError('%s is %s' % (name, current))
+                  time.sleep(5)
+              raise RuntimeError('Server did not reach RUNNING: ' + name)
+
+
+          def provision(c):
+              # Sync domain-specific NM credentials before making component calls.
+              nmEnroll(c['domain_home'], c['domain_home'] + '/nodemanager')
+              connect_nm(c)
+              changed = False
+              serverConfig()
+              if getMBean('/SystemComponents/' + c['tools_name']) is None:
+                  createReportsToolsInstance(instanceName=c['tools_name'], machine=c['machine'])
+                  changed = True
+              for component in c['components']:
+                  serverConfig()
+                  if getMBean('/SystemComponents/' + component['name']) is not None:
+                      continue
+                  if component['type'] == 'OHS':
+                      ohs_createInstance(instanceName=component['name'], machine=c['machine'],
+                                         listenPort=int(c['ohs_port']), sslPort=int(c['ohs_ssl_port']),
+                                         adminPort=int(c['ohs_admin_port']), serverName=c['ohs_server_name'])
+                  else:
+                      createReportsServerInstance(instanceName=component['name'], machine=c['machine'])
+                  changed = True
+              if changed:
+                  print('FR_CHANGED')
+
+
+          def native_start(c):
+              for server in [{'name': 'AdminServer'}] + c['servers']:
+                  wait_server(c, server['name'])
+              connect_nm(c)
+              for component in c['components']:
+                  name, kind = component['name'], component['type']
+                  if nmServerStatus(name, serverType=kind) != 'RUNNING':
+                      nmStart(name, serverType=kind)
+                  deadline = time.time() + int(c['timeout'])
+                  while time.time() < deadline:
+                      status = nmServerStatus(name, serverType=kind)
+                      if status == 'RUNNING':
+                          break
+                      if status in ['FAILED', 'FAILED_NOT_RESTARTABLE']:
+                          raise RuntimeError('Component failed: ' + name)
+                      time.sleep(5)
+                  else:
+                      raise RuntimeError('Component did not reach RUNNING: ' + name)
+
+
+          def native_stop(c):
+              failures = []
+              connect_nm(c)
+              for component in reversed(c['components']):
+                  name, kind = component['name'], component['type']
+                  if nmServerStatus(name, serverType=kind) in ['SHUTDOWN', 'UNKNOWN']:
+                      continue
+                  try:
+                      shutdown(name, 'SystemComponent', block='true')
+                  except:
+                      traceback.print_exc()
+                      failures.append(name)
+              if failures:
+                  raise RuntimeError('Component shutdown failed: ' + ', '.join(failures))
+
+
+          def check(c):
+              for name in ['AdminServer'] + [s['name'] for s in c['servers']]:
+                  wait_server(c, name)
+              connect_nm(c)
+              for component in c['components']:
+                  if nmServerStatus(component['name'], serverType=component['type']) != 'RUNNING':
+                      raise RuntimeError('Component not running: ' + component['name'])
+              print('FR_ALL_RUNNING')
+
+
+          try:
+              with open(sys.argv[1], 'r') as source:
+                  config = json.load(source)
+              action = sys.argv[2]
+              connect_admin(config)
+              if action == 'provision':
+                  wait_server(config, 'AdminServer')
+                  provision(config)
+              elif action == 'start-native':
+                  native_start(config)
+              elif action == 'stop-native':
+                  native_stop(config)
+              elif action == 'stop-server':
+                  shutdown(sys.argv[3], 'Server', ignoreSessions='false', timeOut=int(config['stop_timeout']),
+                           force='false', block='true')
+              elif action == 'check':
+                  check(config)
+              else:
+                  raise RuntimeError('Unknown action: ' + action)
+          except:
+              traceback.print_exc()
+              exit(exitcode=1)
+          exit(exitcode=0)
+    - name: Create repository schemas when requested
+      when: fr_rcu_create | bool
+      block:
+      - name: Validate explicit RCU components
+        ansible.builtin.assert:
+          that:
+          - fr_rcu_components | unique | list | length == fr_rcu_components | length
+          - '[''STB'', ''OPSS'', ''MDS'', ''IAU'', ''IAU_APPEND'', ''IAU_VIEWER'', ''WLS''] | difference(fr_rcu_components)
+            | length == 0'
+      - name: Compute repository identity
+        ansible.builtin.set_fact:
+          fr_rcu_identity: '{{ fr_db_connect }}|{{ fr_rcu_prefix }}|{{ fr_rcu_components | join(",") }}'
+          fr_rcu_component_args: []
+      - name: Build ordered RCU component arguments
+        ansible.builtin.set_fact:
+          fr_rcu_component_args: '{{ fr_rcu_component_args + ["-component", item] }}'
+        loop: '{{ fr_rcu_components }}'
+      - name: Inspect RCU checkpoints
+        ansible.builtin.stat:
+          path: '{{ fr_state }}/rcu.{{ item }}'
+        register: fr_rcu_state
+        loop:
+        - complete
+        - started
+      - name: Read repository checkpoint
+        ansible.builtin.slurp:
+          src: '{{ fr_state }}/rcu.complete'
+        register: fr_rcu_marker
+        when: fr_rcu_state.results[0].stat.exists
+      - name: Reject partial or changed repository creation
+        ansible.builtin.assert:
+          that:
+          - not fr_rcu_state.results[1].stat.exists or fr_rcu_state.results[0].stat.exists
+          - not fr_rcu_state.results[0].stat.exists or (fr_rcu_marker.content | default('') | b64decode | trim)
+            == fr_rcu_identity
+          fail_msg: RCU is partial or repository identity changed. Inspect database schemas and RCU logs before
+            retry.
+      - name: Create repository unattended with ordered passwords on stdin
+        become_user: '{{ fr_os_user }}'
+        environment: '{{ fr_environment }}'
+        when: not fr_rcu_state.results[0].stat.exists
+        block:
+        - name: Mark repository creation started
+          ansible.builtin.copy:
+            dest: '{{ fr_state }}/rcu.started'
+            content: |
+              {{ fr_rcu_identity }}
+            mode: '0600'
+        - name: Run Oracle RCU
+          ansible.builtin.command:
+            argv: '{{ [fr_oracle_home + ''/oracle_common/bin/rcu'', ''-silent'', ''-createRepository'', ''-databaseType'',
+              ''ORACLE'', ''-connectString'', fr_db_connect, ''-dbUser'', fr_db_admin_user, ''-dbRole'', fr_db_admin_role,
+              ''-schemaPrefix'', fr_rcu_prefix, ''-useSamePasswordForAllSchemaUsers'', ''false'', ''-selectDependentsForComponents'',
+              ''false''] + fr_rcu_component_args + [''-f''] }}'
+            stdin: '{{ ([vault_fr_db_password] + ([vault_fr_schema_password] * (fr_rcu_components | length))) |
+              join("\n") }}'
+            stdin_add_newline: true
+          register: fr_rcu_result
+          no_log: true
+          changed_when: true
+        - name: Record successful repository creation
+          ansible.builtin.copy:
+            dest: '{{ fr_state }}/rcu.complete'
+            content: |
+              {{ fr_rcu_identity }}
+            mode: '0600'
+        - name: Remove repository creation start marker
+          ansible.builtin.file:
+            path: '{{ fr_state }}/rcu.started'
+            state: absent
+        always:
+        - name: Save private RCU output
+          ansible.builtin.copy:
+            dest: '{{ fr_log_home }}/rcu-creation.log'
+            content: |
+              {{ fr_rcu_result.stdout | default('') }}
+              {{ fr_rcu_result.stderr | default('') }}
+            mode: '0600'
+          when: fr_rcu_result is defined
+          no_log: true
+    - name: Create domain offline
+      become_user: '{{ fr_os_user }}'
+      environment: '{{ fr_environment }}'
+      when: not fr_config_state.results[3].stat.exists
+      block:
+      - name: Record domain creation start
+        ansible.builtin.copy:
+          dest: '{{ fr_state }}/domain.started'
+          content: |
+            {{ fr_domain_identity }}
+          mode: '0600'
+      - name: Create Forms Reports domain using Oracle templates
+        ansible.builtin.command:
+          argv:
+          - '{{ fr_oracle_home }}/oracle_common/common/bin/wlst.sh'
+          - '{{ fr_state }}/scripts/create_domain.py'
+          - '{{ fr_state }}/secrets/configure.json'
+        async: '{{ fr_install_timeout | int }}'
+        poll: 15
+        register: fr_domain_wlst
+        no_log: true
+        changed_when: true
+      - name: Record completed domain identity
+        ansible.builtin.copy:
+          dest: '{{ fr_state }}/domain.complete'
+          content: |
+            {{ fr_domain_identity }}
+          mode: '0600'
+      - name: Remove domain creation start marker
+        ansible.builtin.file:
+          path: '{{ fr_state }}/domain.started'
+          state: absent
+      always:
+      - name: Save private domain creation output
+        ansible.builtin.copy:
+          dest: '{{ fr_log_home }}/domain-creation.log'
+          content: |
+            {{ fr_domain_wlst.stdout | default('') }}
+            {{ fr_domain_wlst.stderr | default('') }}
+          mode: '0600'
+        when: fr_domain_wlst is defined
+        no_log: true
+    - name: Verify generated domain configuration
+      ansible.builtin.stat:
+        path: '{{ fr_domain_home }}/config/config.xml'
+      register: fr_domain_xml
+    - name: Require valid domain artifact
+      ansible.builtin.assert:
+        that: fr_domain_xml.stat.exists
+    - name: Inspect previously stored runtime credentials
+      ansible.builtin.stat:
+        path: '{{ fr_state }}/secrets/runtime.json'
+      register: fr_runtime_stat
+    - name: Read previously stored runtime credentials
+      ansible.builtin.slurp:
+        src: '{{ fr_state }}/secrets/runtime.json'
+      register: fr_runtime_old
+      when: fr_runtime_stat.stat.exists
+      no_log: true
+    - name: Reject credential rotation through provisioning
+      ansible.builtin.assert:
+        that:
+        - (fr_runtime_old.content | b64decode | from_json).admin_password == vault_fr_admin_password
+        - (fr_runtime_old.content | b64decode | from_json).nm_password == vault_fr_nm_password
+        fail_msg: Credential rotation needs an explicit WebLogic/Node Manager maintenance procedure.
+      when: fr_runtime_stat.stat.exists
+      no_log: true
+    - name: Store private runtime credentials without database passwords
+      ansible.builtin.copy:
+        dest: '{{ fr_state }}/secrets/runtime.json'
+        content: '{{ fr_domain_config | combine({''admin_password'': vault_fr_admin_password, ''nm_password'': vault_fr_nm_password})
+          | to_json }}'
+        owner: '{{ fr_os_user }}'
+        group: '{{ fr_os_group }}'
+        mode: '0600'
+      no_log: true
+    - name: Configure JVMs Node Manager and systemd
+      block:
+      - name: Render supported WebLogic JVM override hook
+        ansible.builtin.copy:
+          dest: '{{ fr_domain_home }}/bin/setUserOverrides.sh'
+          owner: '{{ fr_os_user }}'
+          group: '{{ fr_os_group }}'
+          mode: '0600'
+          content: |
+            #!/bin/bash
+            # Managed by Ansible. Oracle's generated setDomainEnv.sh sources this hook.
+            case "${SERVER_NAME:-AdminServer}" in
+              AdminServer)
+                USER_MEM_ARGS="-Xms{{ fr_admin_xms_mb }}m -Xmx{{ fr_admin_xmx_mb }}m"
+                FR_EXTRA_JVM="{{ fr_admin_jvm_extra }}"
+                ;;
+            {% for server in fr_servers %}
+              {{ server.name }})
+                USER_MEM_ARGS="-Xms{{ fr_forms_xms_mb if server.kind == 'forms' else fr_reports_xms_mb }}m -Xmx{{ fr_forms_xmx_mb if server.kind == 'forms' else fr_reports_xmx_mb }}m"
+                FR_EXTRA_JVM="{{ fr_forms_jvm_extra if server.kind == 'forms' else fr_reports_jvm_extra }}"
+                ;;
+            {% endfor %}
+            esac
+            JAVA_OPTIONS="${JAVA_OPTIONS:-} {{ fr_jvm_common }} ${FR_EXTRA_JVM:-} -XX:HeapDumpPath={{ fr_log_home }}"
+            export USER_MEM_ARGS JAVA_OPTIONS
+      - name: Configure per-domain Node Manager properties
+        ansible.builtin.lineinfile:
+          path: '{{ fr_domain_home }}/nodemanager/nodemanager.properties'
+          regexp: ^{{ item.key }}=
+          line: '{{ item.key }}={{ item.value }}'
+          owner: '{{ fr_os_user }}'
+          group: '{{ fr_os_group }}'
+          mode: '0600'
+          create: false
+        loop:
+        - key: ListenAddress
+          value: '{{ fr_nm_address }}'
+        - key: ListenPort
+          value: '{{ fr_nm_port }}'
+        - key: SecureListener
+          value: 'false'
+        - key: CrashRecoveryEnabled
+          value: 'true'
+        - key: StartScriptEnabled
+          value: 'true'
+        - key: JavaHome
+          value: '{{ fr_java_home }}'
+      - name: Build systemd unit definitions
+        ansible.builtin.set_fact:
+          fr_units: '{{ [{''name'': ''nodemanager'', ''kind'': ''nm''}, {''name'': ''AdminServer'', ''kind'': ''admin''}]
+            + fr_servers + [{''name'': ''components'', ''kind'': ''native''}] }}'
+      - name: Install per-domain systemd units
+        loop: '{{ fr_units }}'
+        register: fr_systemd_units
+        ansible.builtin.copy:
+          dest: /etc/systemd/system/fr14-{{ fr_domain_name }}-{{ item.name }}.service
+          owner: root
+          group: root
+          mode: '0644'
+          content: |
+            [Unit]
+            Description=Oracle FR14 {{ fr_domain_name }} {{ item.name }}
+            Wants=network-online.target
+            After=network-online.target
+            {% if item.kind != 'nm' %}
+            Requires=fr14-{{ fr_domain_name }}-nodemanager.service
+            After=fr14-{{ fr_domain_name }}-nodemanager.service
+            {% endif %}
+            {% if item.kind not in ['nm', 'admin'] %}
+            Requires=fr14-{{ fr_domain_name }}-AdminServer.service
+            After=fr14-{{ fr_domain_name }}-AdminServer.service
+            {% endif %}
+            {% if item.kind == 'native' %}
+            After={% for server in fr_servers %}fr14-{{ fr_domain_name }}-{{ server.name }}.service {% endfor %}
+            {% endif %}
+
+            [Service]
+            User={{ fr_os_user }}
+            Group={{ fr_os_group }}
+            WorkingDirectory={{ fr_domain_home }}
+            Environment="JAVA_HOME={{ fr_java_home }}"
+            Environment="ORACLE_HOME={{ fr_oracle_home }}"
+            Environment="DOMAIN_HOME={{ fr_domain_home }}"
+            Environment="COMPONENT_CONFIG_PATH={{ fr_domain_home }}/config/fmwconfig/components/ReportsToolsComponent/{{ fr_reports_tools_name }}"
+            Environment="PATH={{ fr_java_home }}/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+            Environment="LANG=C.UTF-8"
+            UMask=0077
+            LimitNOFILE={{ fr_nofile }}
+            LimitNPROC={{ fr_nproc }}
+            LimitCORE=0
+            TasksMax={{ fr_tasks_max }}
+            TimeoutStartSec={{ fr_start_timeout }}
+            TimeoutStopSec={{ fr_stop_timeout | int + 60 }}
+            {% if item.kind == 'nm' %}
+            Type=simple
+            ExecStart={{ fr_domain_home }}/bin/startNodeManager.sh
+            Restart=on-failure
+            RestartSec=10
+            {% elif item.kind == 'native' %}
+            Type=oneshot
+            RemainAfterExit=yes
+            ExecStart={{ fr_oracle_home }}/oracle_common/common/bin/wlst.sh {{ fr_state }}/scripts/runtime.py {{ fr_state }}/secrets/runtime.json start-native
+            ExecStop={{ fr_oracle_home }}/oracle_common/common/bin/wlst.sh {{ fr_state }}/scripts/runtime.py {{ fr_state }}/secrets/runtime.json stop-native
+            {% elif item.kind == 'admin' %}
+            Type=simple
+            ExecStart={{ fr_domain_home }}/bin/startWebLogic.sh
+            ExecStop={{ fr_oracle_home }}/oracle_common/common/bin/wlst.sh {{ fr_state }}/scripts/runtime.py {{ fr_state }}/secrets/runtime.json stop-server AdminServer
+            Restart=on-failure
+            RestartSec=15
+            {% else %}
+            Type=simple
+            ExecStart={{ fr_domain_home }}/bin/startManagedWebLogic.sh {{ item.name }} t3://{{ fr_admin_address }}:{{ fr_admin_port }}
+            ExecStop={{ fr_oracle_home }}/oracle_common/common/bin/wlst.sh {{ fr_state }}/scripts/runtime.py {{ fr_state }}/secrets/runtime.json stop-server {{ item.name }}
+            Restart=on-failure
+            RestartSec=15
+            {% endif %}
+            KillMode=control-group
+
+            [Install]
+            WantedBy=multi-user.target
+      - name: Reload changed systemd units
+        ansible.builtin.systemd_service:
+          daemon_reload: true
+        when: fr_systemd_units.changed
+      - name: Enable and start Node Manager and Administration Server
+        ansible.builtin.systemd_service:
+          name: fr14-{{ fr_domain_name }}-{{ item }}
+          enabled: true
+          state: started
+        loop:
+        - nodemanager
+        - AdminServer
+      - name: Wait for administration TCP listener
+        ansible.builtin.wait_for:
+          host: '{{ fr_admin_address }}'
+          port: '{{ fr_admin_port }}'
+          timeout: '{{ fr_start_timeout }}'
+    - name: Provision Reports Tools Reports Servers and optional OHS
+      become_user: '{{ fr_os_user }}'
+      environment: '{{ fr_environment }}'
+      ansible.builtin.command:
+        argv:
+        - '{{ fr_oracle_home }}/oracle_common/common/bin/wlst.sh'
+        - '{{ fr_state }}/scripts/runtime.py'
+        - '{{ fr_state }}/secrets/runtime.json'
+        - provision
+      register: fr_component_creation
+      changed_when: '''FR_CHANGED'' in fr_component_creation.stdout'
+      no_log: true
+    - name: Inspect component tuning checkpoint
+      ansible.builtin.stat:
+        path: '{{ fr_state }}/components-tuned.complete'
+      register: fr_tuned
+    - name: Tune newly provisioned components before startup
+      when: not fr_tuned.stat.exists
+      block:
+      - name: Inspect all native Reports Server configuration files
+        ansible.builtin.stat:
+          path: '{{ fr_domain_home }}/config/fmwconfig/components/ReportsServerComponent/{{ item.name }}/rwserver.conf'
+        loop: '{{ fr_native_components | selectattr(''type'', ''equalto'', ''ReportsServerComponent'') | list }}'
+        register: fr_rwserver_configs
+      - name: Require generated native report configurations
+        ansible.builtin.assert:
+          that: item.stat.exists
+        loop: '{{ fr_rwserver_configs.results }}'
+      - name: Update every native Reports Server rwEng pool
+        community.general.xml:
+          path: '{{ fr_domain_home }}/config/fmwconfig/components/ReportsServerComponent/{{ item[0].item.name }}/rwserver.conf'
+          xpath: //*[local-name()='engine' and @id='rwEng']
+          attribute: '{{ item[1].key }}'
+          value: '{{ item[1].value | string }}'
+          backup: true
+        vars:
+          fr_engine_attributes:
+          - key: minEngine
+            value: '{{ fr_reports_min_engine }}'
+          - key: initEngine
+            value: '{{ fr_reports_init_engine }}'
+          - key: maxEngine
+            value: '{{ fr_reports_max_engine }}'
+          - key: engLife
+            value: '{{ fr_reports_engine_life }}'
+          - key: maxIdle
+            value: '{{ fr_reports_engine_max_idle }}'
+          - key: jvmOptions
+            value: '{{ fr_reports_engine_jvm }}'
+        loop: '{{ fr_rwserver_configs.results | product(fr_engine_attributes) | list }}'
+      - name: Locate generated Reports servlet configuration for every managed server
+        ansible.builtin.find:
+          paths: '{{ fr_domain_home }}/config/fmwconfig/servers/{{ item.name }}/applications'
+          patterns: rwservlet.properties
+          recurse: true
+          file_type: file
+        loop: '{{ fr_servers | selectattr(''kind'', ''equalto'', ''reports'') | list }}'
+        register: fr_servlet_files
+      - name: Require exactly one servlet configuration per Reports managed server
+        ansible.builtin.assert:
+          that: item.matched == 1
+          fail_msg: Unexpected Reports template layout. Inspect generated application configuration before continuing.
+        loop: '{{ fr_servlet_files.results }}'
+      - name: Read every servlet XML namespace
+        ansible.builtin.slurp:
+          src: '{{ item.files[0].path }}'
+        loop: '{{ fr_servlet_files.results }}'
+        register: fr_servlet_contents
+      - name: Point each servlet at its corresponding native Reports Server
+        vars:
+          fr_servlet_namespace: '{{ (item[0].content | b64decode | regex_findall(''xmlns="([^"]+)"'')) | first |
+            default("") }}'
+        community.general.xml:
+          path: '{{ item[0].item.files[0].path }}'
+          xpath: '{{ ''/r:rwservlet/r:'' ~ item[1] if fr_servlet_namespace | length > 0 else ''/rwservlet/'' ~ item[1]
+            }}'
+          namespaces: '{{ {''r'': fr_servlet_namespace} if fr_servlet_namespace | length > 0 else {} }}'
+          value: '{{ fr_reports_component_prefix ~ (item[0].item.item.name | regex_replace(''^'' ~ fr_reports_server_prefix,
+            '''')) if item[1] == ''server'' else ''no'' }}'
+          backup: true
+        loop: '{{ fr_servlet_contents.results | product([''server'', ''inprocess'']) | list }}'
+      - name: Configure optional OHS proxy routes
+        block:
+        - name: Inspect OHS master and runtime configuration locations
+          ansible.builtin.stat:
+            path: '{{ item }}/httpd.conf'
+          register: fr_ohs_locations
+          loop:
+          - '{{ fr_domain_home }}/config/fmwconfig/components/OHS/{{ fr_ohs_name }}'
+          - '{{ fr_domain_home }}/config/fmwconfig/components/OHS/instances/{{ fr_ohs_name }}'
+        - name: Require OHS master configuration
+          ansible.builtin.assert:
+            that: fr_ohs_locations.results[0].stat.exists
+        - name: Read OHS module include configuration
+          ansible.builtin.slurp:
+            src: '{{ item.item }}/httpd.conf'
+          loop: '{{ fr_ohs_locations.results }}'
+          when: item.stat.exists
+          register: fr_httpd_configs
+        - name: Require standard OHS module configuration includes
+          ansible.builtin.assert:
+            that:
+            - (item.content | b64decode | regex_search('(?m)^\s*Include(?:Optional)?\s+[^\n]*moduleconf/')) is not
+              none
+            fail_msg: 'Unexpected OHS httpd.conf layout: moduleconf includes are required for generated Forms/Reports
+              routes.'
+          loop: '{{ fr_httpd_configs.results }}'
+          when: not item.skipped | default(false)
+        - name: Ensure OHS module configuration directories exist
+          ansible.builtin.file:
+            path: '{{ item.item }}/moduleconf'
+            state: directory
+            owner: '{{ fr_os_user }}'
+            group: '{{ fr_os_group }}'
+            mode: '0700'
+          loop: '{{ fr_ohs_locations.results }}'
+          when: item.stat.exists
+        - name: Write Forms and Reports routes using stock module loading
+          ansible.builtin.copy:
+            dest: '{{ item[0].item }}/moduleconf/{{ ''forms.conf'' if item[1] == ''forms'' else ''reports_ohs.conf''
+              }}'
+            content: |
+              # Managed by Ansible for this new domain.
+              <Location /{{ item[1] }}>
+                  SetHandler weblogic-handler
+                  WebLogicCluster {% for s in fr_servers if s.kind == item[1] %}{{ fr_listen_address }}:{{ s.port }}{{ ',' if not loop.last else '' }}{% endfor %}
+
+                  DynamicServerList ON
+                  WLIOTimeoutSecs {{ fr_proxy_timeout }}
+              </Location>
+            owner: '{{ fr_os_user }}'
+            group: '{{ fr_os_group }}'
+            mode: '0600'
+            backup: true
+          loop: '{{ fr_ohs_locations.results | product([''forms'', ''reports'']) | list }}'
+          when: item[0].stat.exists
+        when: fr_ohs_enabled | bool
+      - name: Record component tuning completion
+        ansible.builtin.copy:
+          dest: '{{ fr_state }}/components-tuned.complete'
+          content: |
+            {{ fr_domain_identity }}
+          owner: '{{ fr_os_user }}'
+          group: '{{ fr_os_group }}'
+          mode: '0600'
+    - name: Start managed WebLogic services
+      ansible.builtin.systemd_service:
+        name: fr14-{{ fr_domain_name }}-{{ item.name }}
+        enabled: true
+        state: started
+      loop: '{{ fr_servers }}'
+    - name: Start and enable native component service
+      ansible.builtin.systemd_service:
+        name: fr14-{{ fr_domain_name }}-components
+        enabled: true
+        state: started
+    - name: Verify WebLogic and native runtime states
+      become_user: '{{ fr_os_user }}'
+      environment: '{{ fr_environment }}'
+      ansible.builtin.command:
+        argv:
+        - '{{ fr_oracle_home }}/oracle_common/common/bin/wlst.sh'
+        - '{{ fr_state }}/scripts/runtime.py'
+        - '{{ fr_state }}/secrets/runtime.json'
+        - check
+      changed_when: false
+      no_log: true
+    - name: Verify Forms servlet response on every managed server
+      ansible.builtin.uri:
+        url: http://{{ fr_listen_address }}:{{ item.port }}/forms/frmservlet
+        status_code:
+        - 200
+        - 302
+        return_content: false
+        use_proxy: false
+        timeout: 30
+      loop: '{{ fr_servers | selectattr(''kind'', ''equalto'', ''forms'') | list }}'
+    - name: Verify OHS Forms route
+      ansible.builtin.uri:
+        url: http://{{ fr_listen_address }}:{{ fr_ohs_port }}/forms/frmservlet
+        status_code:
+        - 200
+        - 302
+        return_content: false
+        use_proxy: false
+        timeout: 30
+      when: fr_ohs_enabled | bool
+    - name: Verify Reports servlet is deployed on every managed server
+      ansible.builtin.uri:
+        url: http://{{ fr_listen_address }}:{{ item.port }}/reports/rwservlet
+        status_code:
+        - 200
+        - 302
+        - 401
+        - 403
+        return_content: false
+        use_proxy: false
+        timeout: 30
+      loop: '{{ fr_servers | selectattr(''kind'', ''equalto'', ''reports'') | list }}'
+    - name: Verify OHS Reports route
+      ansible.builtin.uri:
+        url: http://{{ fr_listen_address }}:{{ fr_ohs_port }}/reports/rwservlet
+        status_code:
+        - 200
+        - 302
+        - 401
+        - 403
+        return_content: false
+        use_proxy: false
+        timeout: 30
+      when: fr_ohs_enabled | bool
+    - name: Record finished configuration
+      ansible.builtin.copy:
+        dest: '{{ fr_state }}/configuration.complete'
+        content: |
+          {{ fr_domain_identity }}
+        owner: '{{ fr_os_user }}'
+        group: '{{ fr_os_group }}'
+        mode: '0600'
+    always:
+    - name: Remove transient configuration credentials
+      ansible.builtin.file:
+        path: '{{ fr_state }}/secrets/configure.json'
+        state: absent
+      when: fr_lock is defined and fr_lock is succeeded and not ansible_check_mode
+      no_log: true
+    - name: Release acquired deployment lock
+      ansible.builtin.file:
+        path: '{{ fr_state }}/deployment.lock'
+        state: absent
+      when: fr_lock is defined and fr_lock is succeeded and not ansible_check_mode

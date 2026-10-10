@@ -1,0 +1,914 @@
+# All deployment tasks and generated sources are inline in this playbook.
+---
+- name: Install Oracle Forms Reports middleware and host prerequisites
+  hosts: forms_reports
+  become: true
+  gather_facts: true
+  serial: 1
+  any_errors_fatal: true
+  pre_tasks:
+  - name: Validate platform and deployment settings
+    ansible.builtin.assert:
+      that:
+      - not ansible_check_mode
+      - ansible_distribution == 'OracleLinux'
+      - ansible_architecture == 'x86_64'
+      - (ansible_distribution_major_version == '8' and ansible_distribution_version is version('8.6', '>=')) or
+        (ansible_distribution_major_version == '9' and ansible_distribution_version is version('9.2', '>='))
+      - fr_version == '14.1.2.0.0'
+      - fr_media_location in ['target', 'controller']
+      - fr_domain_name is match('^[A-Za-z][A-Za-z0-9_]*$')
+      - fr_os_user is match('^[a-z_][a-z0-9_-]*$')
+      - fr_os_group is match('^[a-z_][a-z0-9_-]*$')
+      - fr_rcu_prefix is match('^[A-Z][A-Z0-9]{0,11}$')
+      - fr_forms_count | int >= 1
+      - fr_reports_count | int >= 1
+      - fr_admin_address == '127.0.0.1'
+      - fr_nm_address == '127.0.0.1'
+      - fr_listen_address is match('^[A-Za-z0-9][A-Za-z0-9.-]*$')
+      - fr_admin_xms_mb | int > 0
+      - fr_admin_xmx_mb | int >= fr_admin_xms_mb | int
+      - fr_forms_xms_mb | int > 0
+      - fr_forms_xmx_mb | int >= fr_forms_xms_mb | int
+      - fr_reports_xms_mb | int > 0
+      - fr_reports_xmx_mb | int >= fr_reports_xms_mb | int
+      - fr_reports_min_engine | int >= 0
+      - fr_reports_init_engine | int >= fr_reports_min_engine | int
+      - fr_reports_max_engine | int >= fr_reports_init_engine | int
+      - fr_reports_max_engine | int > 0
+      - ansible_memtotal_mb | int >= fr_min_memory_mb | int
+      fail_msg: Requires Oracle Linux x86_64 8.6+ or 9.2+, valid parameters and sufficient RAM. Check mode cannot
+        simulate Oracle installers/WLST; use --syntax-check.
+    tags:
+    - parameters
+  - name: Validate filesystem paths
+    ansible.builtin.assert:
+      that:
+      - item is match('^/[A-Za-z0-9_./-]+$')
+      - '''..'' not in item.split(''/'')'
+      - item != '/'
+    loop:
+    - '{{ fr_os_home }}'
+    - '{{ fr_oracle_base }}'
+    - '{{ fr_oracle_home }}'
+    - '{{ fr_inventory_home }}'
+    - '{{ fr_inventory_pointer }}'
+    - '{{ fr_stage }}'
+    - '{{ fr_state }}'
+    - '{{ fr_domain_home }}'
+    - '{{ fr_application_home }}'
+    - '{{ fr_log_home }}'
+    - '{{ fr_java_parent }}'
+    - '{{ fr_java_home }}'
+    tags:
+    - parameters
+  - name: Require distinct RCU prefixes for hosts sharing a repository database
+    ansible.builtin.assert:
+      that:
+      - hostvars[item].fr_db_connect != fr_db_connect or hostvars[item].fr_rcu_prefix != fr_rcu_prefix
+      fail_msg: Each independent domain on the same database needs a unique RCU prefix. Set host_vars overrides.
+    loop: '{{ ansible_play_hosts_all }}'
+    when: item != inventory_hostname
+    tags:
+    - parameters
+  - name: Validate names used by Oracle and systemd
+    ansible.builtin.assert:
+      that:
+      - item is match('^[A-Za-z][A-Za-z0-9_]*$')
+    loop:
+    - '{{ fr_machine_name }}'
+    - '{{ fr_forms_cluster }}'
+    - '{{ fr_reports_cluster }}'
+    - '{{ fr_forms_server_prefix }}'
+    - '{{ fr_reports_server_prefix }}'
+    - '{{ fr_reports_component_prefix }}'
+    - '{{ fr_reports_tools_name }}'
+    - '{{ fr_ohs_name }}'
+    tags:
+    - parameters
+  - name: Validate layout and JVM shell values
+    ansible.builtin.assert:
+      that:
+      - not fr_domain_home.startswith(fr_oracle_home + '/')
+      - fr_domain_home != fr_oracle_home
+      - fr_java_home == fr_java_parent + '/' + fr_jdk_directory
+      - fr_forms_cluster != fr_reports_cluster
+      - fr_forms_server_prefix != fr_reports_server_prefix
+      - fr_jdk_directory is match('^[A-Za-z0-9_.-]+$')
+      - item is match('^[A-Za-z0-9_ ./,:=+%-]*$')
+    loop:
+    - '{{ fr_jvm_common }}'
+    - '{{ fr_admin_jvm_extra }}'
+    - '{{ fr_forms_jvm_extra }}'
+    - '{{ fr_reports_jvm_extra }}'
+    - '{{ fr_reports_engine_jvm }}'
+    tags:
+    - parameters
+  - name: Initialize derived lists
+    ansible.builtin.set_fact:
+      fr_servers: []
+      fr_native_components: []
+      fr_ports:
+      - '{{ fr_admin_port | int }}'
+      - '{{ fr_nm_port | int }}'
+      fr_environment:
+        JAVA_HOME: '{{ fr_java_home }}'
+        ORACLE_HOME: '{{ fr_oracle_home }}'
+        MW_HOME: '{{ fr_oracle_home }}'
+        DOMAIN_HOME: '{{ fr_domain_home }}'
+        PATH: '{{ fr_java_home }}/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+        LANG: C.UTF-8
+    tags:
+    - parameters
+  - name: Derive Forms managed servers
+    ansible.builtin.set_fact:
+      fr_servers: '{{ fr_servers + [{''name'': fr_forms_server_prefix ~ item, ''port'': (fr_forms_port_base | int
+        + item | int - 1), ''kind'': ''forms''}] }}'
+      fr_ports: '{{ fr_ports + [fr_forms_port_base | int + item | int - 1] }}'
+    loop: '{{ range(1, fr_forms_count | int + 1) | list }}'
+    tags:
+    - parameters
+  - name: Derive Reports managed servers and native servers
+    ansible.builtin.set_fact:
+      fr_servers: '{{ fr_servers + [{''name'': fr_reports_server_prefix ~ item, ''port'': (fr_reports_port_base
+        | int + item | int - 1), ''kind'': ''reports''}] }}'
+      fr_native_components: '{{ fr_native_components + [{''name'': fr_reports_component_prefix ~ item, ''type'':
+        ''ReportsServerComponent''}] }}'
+      fr_ports: '{{ fr_ports + [fr_reports_port_base | int + item | int - 1] }}'
+    loop: '{{ range(1, fr_reports_count | int + 1) | list }}'
+    tags:
+    - parameters
+  - name: Include optional OHS ports and component
+    ansible.builtin.set_fact:
+      fr_ports: '{{ fr_ports + [fr_ohs_port | int, fr_ohs_ssl_port | int, fr_ohs_admin_port | int] }}'
+      fr_native_components: '{{ fr_native_components + [{''name'': fr_ohs_name, ''type'': ''OHS''}] }}'
+    when: fr_ohs_enabled | bool
+    tags:
+    - parameters
+  - name: Validate unique unprivileged listeners
+    ansible.builtin.assert:
+      that:
+      - fr_ports | map('int') | unique | list | length == fr_ports | length
+      - fr_ports | map('int') | min >= 1024
+      - fr_ports | map('int') | max <= 65535
+      - fr_servers | map(attribute='name') | unique | list | length == fr_servers | length
+      - fr_native_components | map(attribute='name') | unique | list | length == fr_native_components | length
+      - fr_reports_tools_name not in (fr_native_components | map(attribute='name') | list)
+    tags:
+    - parameters
+  - name: Build public domain configuration
+    ansible.builtin.set_fact:
+      fr_domain_config:
+        version: '{{ fr_version }}'
+        domain_name: '{{ fr_domain_name }}'
+        domain_home: '{{ fr_domain_home }}'
+        oracle_home: '{{ fr_oracle_home }}'
+        java_home: '{{ fr_java_home }}'
+        application_home: '{{ fr_application_home }}'
+        listen_address: '{{ fr_listen_address }}'
+        admin_address: '{{ fr_admin_address }}'
+        admin_port: '{{ fr_admin_port | int }}'
+        admin_user: '{{ fr_admin_user }}'
+        nm_address: '{{ fr_nm_address }}'
+        nm_port: '{{ fr_nm_port | int }}'
+        nm_user: '{{ fr_nm_user }}'
+        machine: '{{ fr_machine_name }}'
+        templates: '{{ fr_templates + ([''Oracle HTTP Server (Colocated)''] if fr_ohs_enabled | bool else []) }}'
+        jdbc_url: '{{ fr_db_jdbc_url }}'
+        rcu_prefix: '{{ fr_rcu_prefix }}'
+        servers: '{{ fr_servers }}'
+        forms_cluster: '{{ fr_forms_cluster }}'
+        reports_cluster: '{{ fr_reports_cluster }}'
+        forms_groups: '{{ fr_forms_server_groups }}'
+        reports_groups: '{{ fr_reports_server_groups }}'
+        tools_name: '{{ fr_reports_tools_name }}'
+        components: '{{ fr_native_components }}'
+        ohs_enabled: '{{ fr_ohs_enabled | bool }}'
+        ohs_name: '{{ fr_ohs_name }}'
+        ohs_port: '{{ fr_ohs_port | int }}'
+        ohs_ssl_port: '{{ fr_ohs_ssl_port | int }}'
+        ohs_admin_port: '{{ fr_ohs_admin_port | int }}'
+        ohs_server_name: '{{ fr_ohs_server_name }}'
+        timeout: '{{ fr_start_timeout | int }}'
+        stop_timeout: '{{ fr_stop_timeout | int }}'
+        tuning:
+          admin_heap: '{{ [fr_admin_xms_mb, fr_admin_xmx_mb] }}'
+          forms_heap: '{{ [fr_forms_xms_mb, fr_forms_xmx_mb] }}'
+          reports_heap: '{{ [fr_reports_xms_mb, fr_reports_xmx_mb] }}'
+          jvm: '{{ [fr_jvm_common, fr_admin_jvm_extra, fr_forms_jvm_extra, fr_reports_jvm_extra] }}'
+          engine: '{{ [fr_reports_min_engine, fr_reports_init_engine, fr_reports_max_engine, fr_reports_engine_life,
+            fr_reports_engine_max_idle, fr_reports_engine_jvm] }}'
+          proxy_timeout: '{{ fr_proxy_timeout }}'
+    tags:
+    - parameters
+  - name: Compute immutable domain identity
+    ansible.builtin.set_fact:
+      fr_domain_identity: '{{ fr_domain_config | to_json(sort_keys=True) | hash("sha256") }}'
+    tags:
+    - parameters
+  - name: Install OS prerequisite packages
+    ansible.builtin.dnf:
+      name: '{{ fr_os_packages }}'
+      state: present
+  - name: Create inventory group
+    ansible.builtin.group:
+      name: '{{ fr_os_group }}'
+      state: present
+  - name: Create middleware OS account
+    ansible.builtin.user:
+      name: '{{ fr_os_user }}'
+      group: '{{ fr_os_group }}'
+      home: '{{ fr_os_home }}'
+      shell: /bin/bash
+      create_home: true
+      password_lock: true
+  - name: Create installation directories
+    ansible.builtin.file:
+      path: '{{ item }}'
+      state: directory
+      owner: '{{ fr_os_user }}'
+      group: '{{ fr_os_group }}'
+      mode: '0700'
+    loop:
+    - '{{ fr_oracle_base }}'
+    - '{{ fr_oracle_home }}'
+    - '{{ fr_java_parent }}'
+    - '{{ fr_inventory_home }}'
+    - '{{ fr_stage }}'
+    - '{{ fr_state }}'
+    - '{{ fr_state }}/scripts'
+    - '{{ fr_state }}/secrets'
+    - '{{ fr_log_home }}'
+    - '{{ fr_domain_home | dirname }}'
+    - '{{ fr_application_home }}'
+  - name: Inspect Oracle inventory pointer
+    ansible.builtin.stat:
+      path: '{{ fr_inventory_pointer }}'
+    register: fr_pointer
+  - name: Read existing inventory pointer
+    ansible.builtin.slurp:
+      src: '{{ fr_inventory_pointer }}'
+    register: fr_pointer_content
+    when: fr_pointer.stat.exists
+  - name: Validate existing inventory ownership
+    ansible.builtin.assert:
+      that:
+      - ('inventory_loc=' ~ fr_inventory_home) in (fr_pointer_content.content | b64decode).splitlines()
+      - ('inst_group=' ~ fr_os_group) in (fr_pointer_content.content | b64decode).splitlines()
+      fail_msg: Existing Oracle inventory differs. Reconcile it before installation.
+    when: fr_pointer.stat.exists
+  - name: Write inventory pointer for installers
+    ansible.builtin.copy:
+      dest: '{{ fr_inventory_pointer }}'
+      content: |
+        inventory_loc={{ fr_inventory_home }}
+        inst_group={{ fr_os_group }}
+      owner: root
+      group: '{{ fr_os_group }}'
+      mode: '0640'
+      force: false
+  - name: Set PAM account resource limits
+    ansible.builtin.copy:
+      dest: /etc/security/limits.d/99-fr14-{{ fr_os_user }}.conf
+      content: |
+        {{ fr_os_user }} soft nofile {{ fr_nofile }}
+        {{ fr_os_user }} hard nofile {{ fr_nofile }}
+        {{ fr_os_user }} soft nproc {{ fr_nproc }}
+        {{ fr_os_user }} hard nproc {{ fr_nproc }}
+        {{ fr_os_user }} soft core 0
+        {{ fr_os_user }} hard core 0
+      owner: root
+      group: root
+      mode: '0644'
+  - name: Set middleware kernel limits
+    ansible.builtin.copy:
+      dest: /etc/sysctl.d/99-fr14.conf
+      content: |
+        {% for key, value in fr_sysctl.items() %}
+        {{ key }} = {{ value }}
+        {% endfor %}
+      owner: root
+      group: root
+      mode: '0644'
+    register: fr_sysctl_file
+  - name: Apply managed kernel limits
+    ansible.builtin.command:
+      argv:
+      - /usr/sbin/sysctl
+      - -p
+      - /etc/sysctl.d/99-fr14.conf
+    when: fr_sysctl_file.changed
+    changed_when: true
+  - name: Enable time synchronization
+    ansible.builtin.systemd_service:
+      name: chronyd
+      enabled: true
+      state: started
+    when: fr_manage_chrony | bool
+  tasks:
+  - name: Install under an exclusive deployment lock
+    block:
+    - name: Acquire deployment lock
+      become_user: '{{ fr_os_user }}'
+      ansible.builtin.command:
+        argv:
+        - /usr/bin/mkdir
+        - '{{ fr_state }}/deployment.lock'
+      register: fr_lock
+      changed_when: true
+    - name: Build required media list
+      ansible.builtin.set_fact:
+        fr_media:
+        - file: '{{ fr_jdk_archive }}'
+          sha256: '{{ fr_jdk_sha256 }}'
+          mode: '0600'
+        - file: '{{ fr_infra_installer }}'
+          sha256: '{{ fr_infra_sha256 }}'
+          mode: '0600'
+        - file: '{{ fr_forms_installer }}'
+          sha256: '{{ fr_forms_sha256 }}'
+          mode: '0700'
+        fr_installers:
+        - name: infrastructure
+          file: '{{ fr_infra_installer }}'
+          sha256: '{{ fr_infra_sha256 }}'
+          type: '{{ fr_infra_install_type }}'
+          java: true
+          probe: wlserver/server/lib/weblogic.jar
+        - name: forms_reports
+          file: '{{ fr_forms_installer }}'
+          sha256: '{{ fr_forms_sha256 }}'
+          type: '{{ fr_forms_install_type }}'
+          java: false
+          probe: forms/common/templates/wls/forms_template.jar
+    - name: Include separate OHS media if requested
+      ansible.builtin.set_fact:
+        fr_media: '{{ fr_media + [{''file'': fr_ohs_installer, ''sha256'': fr_ohs_sha256, ''mode'': ''0700''}] }}'
+        fr_installers: '{{ fr_installers + [{''name'': ''ohs'', ''file'': fr_ohs_installer, ''sha256'': fr_ohs_sha256,
+          ''type'': fr_ohs_install_type, ''java'': false, ''probe'': ''ohs/common/templates/wls/ohs_managed_template.jar''}]
+          }}'
+      when: fr_ohs_enabled | bool and fr_ohs_install_separately | bool
+    - name: Validate media filenames and required hashes
+      ansible.builtin.assert:
+        that:
+        - item.file is match('^[A-Za-z0-9_.-]+$')
+        - item.sha256 is match('^[a-fA-F0-9]{64}$')
+        fail_msg: Set independently verified SHA-256 checksums and media filenames in parameters.yml.
+      loop: '{{ fr_media }}'
+    - name: Validate companion filenames
+      ansible.builtin.assert:
+        that:
+        - item is match('^[A-Za-z0-9_.-]+$')
+      loop: '{{ fr_media_companion_files }}'
+    - name: Validate controller media directory
+      ansible.builtin.assert:
+        that:
+        - fr_controller_media_dir is match('^/[A-Za-z0-9_./-]+$')
+        - '''..'' not in fr_controller_media_dir.split(''/'')'
+      when: fr_media_location == 'controller'
+    - name: Copy Oracle media from controller
+      ansible.builtin.copy:
+        src: '{{ fr_controller_media_dir }}/{{ item.file }}'
+        dest: '{{ fr_stage }}/{{ item.file }}'
+        owner: '{{ fr_os_user }}'
+        group: '{{ fr_os_group }}'
+        mode: '{{ item.mode }}'
+      loop: '{{ fr_media }}'
+      when: fr_media_location == 'controller'
+    - name: Copy native installer companion files from controller
+      ansible.builtin.copy:
+        src: '{{ fr_controller_media_dir }}/{{ item }}'
+        dest: '{{ fr_stage }}/{{ item }}'
+        owner: '{{ fr_os_user }}'
+        group: '{{ fr_os_group }}'
+        mode: '0600'
+      loop: '{{ fr_media_companion_files }}'
+      when: fr_media_location == 'controller'
+    - name: Inspect media integrity
+      ansible.builtin.stat:
+        path: '{{ fr_stage }}/{{ item.file }}'
+        checksum_algorithm: sha256
+        get_checksum: true
+      register: fr_media_stats
+      loop: '{{ fr_media }}'
+    - name: Reject missing or altered media
+      ansible.builtin.assert:
+        that:
+        - item.stat.exists
+        - item.stat.isreg | default(false)
+        - item.stat.checksum | default('') == item.item.sha256 | lower
+      loop: '{{ fr_media_stats.results }}'
+      loop_control:
+        label: '{{ item.item.file }}'
+    - name: Set middleware media ownership and permissions
+      ansible.builtin.file:
+        path: '{{ fr_stage }}/{{ item.file }}'
+        owner: '{{ fr_os_user }}'
+        group: '{{ fr_os_group }}'
+        mode: '{{ item.mode }}'
+      loop: '{{ fr_media }}'
+    - name: Set native companion file ownership and permissions
+      ansible.builtin.file:
+        path: '{{ fr_stage }}/{{ item }}'
+        owner: '{{ fr_os_user }}'
+        group: '{{ fr_os_group }}'
+        mode: '0600'
+      loop: '{{ fr_media_companion_files }}'
+    - name: Check filesystem capacity
+      ansible.builtin.command:
+        argv:
+        - /usr/bin/df
+        - -Pm
+        - '{{ item.path }}'
+      changed_when: false
+      register: fr_capacity
+      loop:
+      - path: '{{ fr_oracle_home }}'
+        minimum: '{{ fr_min_free_oracle_mb }}'
+      - path: '{{ fr_state }}'
+        minimum: '{{ fr_min_free_domain_mb }}'
+    - name: Require installation capacity
+      ansible.builtin.assert:
+        that:
+        - item.stdout_lines[-1].split()[3] | int >= item.item.minimum | int
+      loop: '{{ fr_capacity.results }}'
+      loop_control:
+        label: '{{ item.item.path }}'
+    - name: Install certified Oracle JDK
+      block:
+      - name: Inspect JDK checkpoint and installation
+        ansible.builtin.stat:
+          path: '{{ item }}'
+        register: fr_jdk_state
+        loop:
+        - '{{ fr_state }}/jdk.complete'
+        - '{{ fr_state }}/jdk.started'
+        - '{{ fr_java_home }}'
+      - name: Read completed JDK identity
+        ansible.builtin.slurp:
+          src: '{{ fr_state }}/jdk.complete'
+        register: fr_jdk_marker
+        when: fr_jdk_state.results[0].stat.exists
+      - name: Reject partial or changed JDK installations
+        ansible.builtin.assert:
+          that:
+          - not fr_jdk_state.results[1].stat.exists or fr_jdk_state.results[0].stat.exists
+          - not fr_jdk_state.results[2].stat.exists or fr_jdk_state.results[0].stat.exists
+          - not fr_jdk_state.results[0].stat.exists or fr_jdk_state.results[2].stat.exists
+          - not fr_jdk_state.results[0].stat.exists or (fr_jdk_marker.content | default('') | b64decode | trim)
+            == fr_java_home ~ '|' ~ fr_jdk_sha256
+          fail_msg: Existing, partial, or changed JDK installation requires reconciliation. Do not delete checkpoints
+            blindly.
+      - name: Extract Oracle JDK archive
+        become_user: '{{ fr_os_user }}'
+        when: not fr_jdk_state.results[0].stat.exists
+        block:
+        - name: Mark JDK extraction started
+          ansible.builtin.copy:
+            dest: '{{ fr_state }}/jdk.started'
+            content: |
+              {{ fr_java_home }}|{{ fr_jdk_sha256 }}
+            mode: '0600'
+        - name: Extract JDK into Java parent directory
+          ansible.builtin.unarchive:
+            src: '{{ fr_stage }}/{{ fr_jdk_archive }}'
+            dest: '{{ fr_java_parent }}'
+            remote_src: true
+        - name: Verify extracted JDK executable
+          ansible.builtin.stat:
+            path: '{{ fr_java_home }}/bin/java'
+          register: fr_java_executable
+        - name: Require expected JDK archive layout
+          ansible.builtin.assert:
+            that: fr_java_executable.stat.executable | default(false)
+        - name: Record successful JDK extraction
+          ansible.builtin.copy:
+            dest: '{{ fr_state }}/jdk.complete'
+            content: |
+              {{ fr_java_home }}|{{ fr_jdk_sha256 }}
+            mode: '0600'
+        - name: Remove JDK extraction start marker
+          ansible.builtin.file:
+            path: '{{ fr_state }}/jdk.started'
+            state: absent
+      - name: Read installed JDK release metadata
+        ansible.builtin.slurp:
+          src: '{{ fr_java_home }}/release'
+        register: fr_java_release
+      - name: Derive Oracle Java release version
+        ansible.builtin.set_fact:
+          fr_java_version: '{{ (fr_java_release.content | b64decode | regex_findall(''(?m)^JAVA_VERSION="([^"]+)"''))
+            | first }}'
+      - name: Require supported Oracle JDK baseline
+        ansible.builtin.assert:
+          that:
+          - '''IMPLEMENTOR="Oracle Corporation"'' in (fr_java_release.content | b64decode)'
+          - (fr_java_version.split('.')[0] == '17' and fr_java_version is version('17.0.12', '>=')) or (fr_java_version.split('.')[0]
+            == '21' and fr_java_version is version('21.0.4', '>='))
+          fail_msg: Use a certified Oracle JDK 17.0.12+ or 21.0.4+ update.
+      - name: Execute installed JDK
+        become_user: '{{ fr_os_user }}'
+        ansible.builtin.command:
+          argv:
+          - '{{ fr_java_home }}/bin/java'
+          - -version
+        changed_when: false
+    - name: Install Infrastructure
+      vars:
+        fr_installer: '{{ fr_installers[0] }}'
+      block:
+      - name: Inspect installer state
+        ansible.builtin.stat:
+          path: '{{ item }}'
+        register: fr_installer_state
+        loop:
+        - '{{ fr_state }}/{{ fr_installer.name }}.complete'
+        - '{{ fr_state }}/{{ fr_installer.name }}.started'
+        - '{{ fr_oracle_home }}/{{ fr_installer.probe }}'
+      - name: Compute installer identity
+        ansible.builtin.set_fact:
+          fr_installer_identity: '{{ fr_oracle_home }}|{{ fr_installer.sha256 }}|{{ fr_installer.type }}|{{ fr_java_home
+            }}'
+      - name: Inspect an unowned Oracle home before first Infrastructure installation
+        ansible.builtin.find:
+          paths: '{{ fr_oracle_home }}'
+          recurse: false
+          hidden: true
+          file_type: any
+        register: fr_home_entries
+        when: fr_installer.name == 'infrastructure' and not fr_installer_state.results[0].stat.exists
+      - name: Require an empty home for first Infrastructure installation
+        ansible.builtin.assert:
+          that: fr_home_entries.matched == 0
+          fail_msg: Unmanaged nonempty Oracle home. Use a new home or reconcile Oracle inventory ownership.
+        when: fr_installer.name == 'infrastructure' and not fr_installer_state.results[0].stat.exists
+      - name: Read completed installer identity
+        ansible.builtin.slurp:
+          src: '{{ fr_state }}/{{ fr_installer.name }}.complete'
+        register: fr_installer_marker
+        when: fr_installer_state.results[0].stat.exists
+      - name: Reject unmanaged partial or changed installations
+        ansible.builtin.assert:
+          that:
+          - not fr_installer_state.results[1].stat.exists or fr_installer_state.results[0].stat.exists
+          - not fr_installer_state.results[2].stat.exists or fr_installer_state.results[0].stat.exists
+          - not fr_installer_state.results[0].stat.exists or fr_installer_state.results[2].stat.exists
+          - not fr_installer_state.results[0].stat.exists or (fr_installer_marker.content | default('') | b64decode
+            | trim) == fr_installer_identity
+          fail_msg: '{{ fr_installer.name }} is unmanaged, incomplete, or its inputs changed. Reconcile inventory
+            and logs before retry.'
+      - name: Run silent installer
+        become_user: '{{ fr_os_user }}'
+        environment: '{{ fr_environment }}'
+        when: not fr_installer_state.results[0].stat.exists
+        block:
+        - name: Render Oracle installer response file
+          ansible.builtin.copy:
+            dest: '{{ fr_state }}/{{ fr_installer.name }}.rsp'
+            mode: '0600'
+            content: |
+              [ENGINE]
+              Response File Version=1.0.0.0.0
+              [GENERIC]
+              ORACLE_HOME={{ fr_oracle_home }}
+              INSTALL_TYPE={{ fr_installer.type }}
+              DECLINE_SECURITY_UPDATES=true
+              SECURITY_UPDATES_VIA_MYORACLESUPPORT=false
+        - name: Record installation start
+          ansible.builtin.copy:
+            dest: '{{ fr_state }}/{{ fr_installer.name }}.started'
+            content: |
+              {{ fr_installer_identity }}
+            mode: '0600'
+        - name: Execute Oracle silent installer
+          ansible.builtin.command:
+            argv: '{{ ([fr_java_home + ''/bin/java'', ''-jar'', fr_stage + ''/'' + fr_installer.file] if fr_installer.java
+              else [fr_stage + ''/'' + fr_installer.file, ''-jreLoc'', fr_java_home]) + [''-silent'', ''-responseFile'',
+              fr_state + ''/'' + fr_installer.name + ''.rsp'', ''-invPtrLoc'', fr_inventory_pointer] }}'
+            chdir: '{{ fr_stage }}'
+          async: '{{ fr_install_timeout | int }}'
+          poll: 15
+          register: fr_install_result
+          changed_when: true
+        - name: Save private installer output
+          ansible.builtin.copy:
+            dest: '{{ fr_log_home }}/{{ fr_installer.name }}-install.log'
+            content: |
+              {{ fr_install_result.stdout }}
+              {{ fr_install_result.stderr }}
+            mode: '0600'
+        - name: Verify installer artifact
+          ansible.builtin.stat:
+            path: '{{ fr_oracle_home }}/{{ fr_installer.probe }}'
+          register: fr_installed_probe
+        - name: Require installer completion artifact
+          ansible.builtin.assert:
+            that: fr_installed_probe.stat.exists
+        - name: Record completed installation
+          ansible.builtin.copy:
+            dest: '{{ fr_state }}/{{ fr_installer.name }}.complete'
+            content: |
+              {{ fr_installer_identity }}
+            mode: '0600'
+        - name: Remove installer start marker
+          ansible.builtin.file:
+            path: '{{ fr_state }}/{{ fr_installer.name }}.started'
+            state: absent
+      - name: Inspect Oracle inventory root script
+        ansible.builtin.stat:
+          path: '{{ fr_inventory_home }}/orainstRoot.sh'
+        register: fr_inventory_root_script
+      - name: Complete Oracle inventory root setup
+        ansible.builtin.command:
+          argv:
+          - /bin/sh
+          - '{{ fr_inventory_home }}/orainstRoot.sh'
+          creates: '{{ fr_state }}/inventory-root.complete'
+        when: fr_inventory_root_script.stat.exists
+        register: fr_inventory_root_result
+      - name: Record inventory root setup
+        ansible.builtin.copy:
+          dest: '{{ fr_state }}/inventory-root.complete'
+          content: |
+            Oracle inventory root script completed
+          owner: '{{ fr_os_user }}'
+          group: '{{ fr_os_group }}'
+          mode: '0600'
+        when: fr_inventory_root_script.stat.exists and fr_inventory_root_result is succeeded
+    - name: Install Forms and Reports
+      vars:
+        fr_installer: '{{ fr_installers[1] }}'
+      block:
+      - name: Inspect installer state
+        ansible.builtin.stat:
+          path: '{{ item }}'
+        register: fr_installer_state
+        loop:
+        - '{{ fr_state }}/{{ fr_installer.name }}.complete'
+        - '{{ fr_state }}/{{ fr_installer.name }}.started'
+        - '{{ fr_oracle_home }}/{{ fr_installer.probe }}'
+      - name: Compute installer identity
+        ansible.builtin.set_fact:
+          fr_installer_identity: '{{ fr_oracle_home }}|{{ fr_installer.sha256 }}|{{ fr_installer.type }}|{{ fr_java_home
+            }}'
+      - name: Inspect an unowned Oracle home before first Infrastructure installation
+        ansible.builtin.find:
+          paths: '{{ fr_oracle_home }}'
+          recurse: false
+          hidden: true
+          file_type: any
+        register: fr_home_entries
+        when: fr_installer.name == 'infrastructure' and not fr_installer_state.results[0].stat.exists
+      - name: Require an empty home for first Infrastructure installation
+        ansible.builtin.assert:
+          that: fr_home_entries.matched == 0
+          fail_msg: Unmanaged nonempty Oracle home. Use a new home or reconcile Oracle inventory ownership.
+        when: fr_installer.name == 'infrastructure' and not fr_installer_state.results[0].stat.exists
+      - name: Read completed installer identity
+        ansible.builtin.slurp:
+          src: '{{ fr_state }}/{{ fr_installer.name }}.complete'
+        register: fr_installer_marker
+        when: fr_installer_state.results[0].stat.exists
+      - name: Reject unmanaged partial or changed installations
+        ansible.builtin.assert:
+          that:
+          - not fr_installer_state.results[1].stat.exists or fr_installer_state.results[0].stat.exists
+          - not fr_installer_state.results[2].stat.exists or fr_installer_state.results[0].stat.exists
+          - not fr_installer_state.results[0].stat.exists or fr_installer_state.results[2].stat.exists
+          - not fr_installer_state.results[0].stat.exists or (fr_installer_marker.content | default('') | b64decode
+            | trim) == fr_installer_identity
+          fail_msg: '{{ fr_installer.name }} is unmanaged, incomplete, or its inputs changed. Reconcile inventory
+            and logs before retry.'
+      - name: Run silent installer
+        become_user: '{{ fr_os_user }}'
+        environment: '{{ fr_environment }}'
+        when: not fr_installer_state.results[0].stat.exists
+        block:
+        - name: Render Oracle installer response file
+          ansible.builtin.copy:
+            dest: '{{ fr_state }}/{{ fr_installer.name }}.rsp'
+            mode: '0600'
+            content: |
+              [ENGINE]
+              Response File Version=1.0.0.0.0
+              [GENERIC]
+              ORACLE_HOME={{ fr_oracle_home }}
+              INSTALL_TYPE={{ fr_installer.type }}
+              DECLINE_SECURITY_UPDATES=true
+              SECURITY_UPDATES_VIA_MYORACLESUPPORT=false
+        - name: Record installation start
+          ansible.builtin.copy:
+            dest: '{{ fr_state }}/{{ fr_installer.name }}.started'
+            content: |
+              {{ fr_installer_identity }}
+            mode: '0600'
+        - name: Execute Oracle silent installer
+          ansible.builtin.command:
+            argv: '{{ ([fr_java_home + ''/bin/java'', ''-jar'', fr_stage + ''/'' + fr_installer.file] if fr_installer.java
+              else [fr_stage + ''/'' + fr_installer.file, ''-jreLoc'', fr_java_home]) + [''-silent'', ''-responseFile'',
+              fr_state + ''/'' + fr_installer.name + ''.rsp'', ''-invPtrLoc'', fr_inventory_pointer] }}'
+            chdir: '{{ fr_stage }}'
+          async: '{{ fr_install_timeout | int }}'
+          poll: 15
+          register: fr_install_result
+          changed_when: true
+        - name: Save private installer output
+          ansible.builtin.copy:
+            dest: '{{ fr_log_home }}/{{ fr_installer.name }}-install.log'
+            content: |
+              {{ fr_install_result.stdout }}
+              {{ fr_install_result.stderr }}
+            mode: '0600'
+        - name: Verify installer artifact
+          ansible.builtin.stat:
+            path: '{{ fr_oracle_home }}/{{ fr_installer.probe }}'
+          register: fr_installed_probe
+        - name: Require installer completion artifact
+          ansible.builtin.assert:
+            that: fr_installed_probe.stat.exists
+        - name: Record completed installation
+          ansible.builtin.copy:
+            dest: '{{ fr_state }}/{{ fr_installer.name }}.complete'
+            content: |
+              {{ fr_installer_identity }}
+            mode: '0600'
+        - name: Remove installer start marker
+          ansible.builtin.file:
+            path: '{{ fr_state }}/{{ fr_installer.name }}.started'
+            state: absent
+      - name: Inspect Oracle inventory root script
+        ansible.builtin.stat:
+          path: '{{ fr_inventory_home }}/orainstRoot.sh'
+        register: fr_inventory_root_script
+      - name: Complete Oracle inventory root setup
+        ansible.builtin.command:
+          argv:
+          - /bin/sh
+          - '{{ fr_inventory_home }}/orainstRoot.sh'
+          creates: '{{ fr_state }}/inventory-root.complete'
+        when: fr_inventory_root_script.stat.exists
+        register: fr_inventory_root_result
+      - name: Record inventory root setup
+        ansible.builtin.copy:
+          dest: '{{ fr_state }}/inventory-root.complete'
+          content: |
+            Oracle inventory root script completed
+          owner: '{{ fr_os_user }}'
+          group: '{{ fr_os_group }}'
+          mode: '0600'
+        when: fr_inventory_root_script.stat.exists and fr_inventory_root_result is succeeded
+    - name: Install optional separate OHS
+      vars:
+        fr_installer: '{{ fr_installers[2] }}'
+      block:
+      - name: Inspect installer state
+        ansible.builtin.stat:
+          path: '{{ item }}'
+        register: fr_installer_state
+        loop:
+        - '{{ fr_state }}/{{ fr_installer.name }}.complete'
+        - '{{ fr_state }}/{{ fr_installer.name }}.started'
+        - '{{ fr_oracle_home }}/{{ fr_installer.probe }}'
+      - name: Compute installer identity
+        ansible.builtin.set_fact:
+          fr_installer_identity: '{{ fr_oracle_home }}|{{ fr_installer.sha256 }}|{{ fr_installer.type }}|{{ fr_java_home
+            }}'
+      - name: Inspect an unowned Oracle home before first Infrastructure installation
+        ansible.builtin.find:
+          paths: '{{ fr_oracle_home }}'
+          recurse: false
+          hidden: true
+          file_type: any
+        register: fr_home_entries
+        when: fr_installer.name == 'infrastructure' and not fr_installer_state.results[0].stat.exists
+      - name: Require an empty home for first Infrastructure installation
+        ansible.builtin.assert:
+          that: fr_home_entries.matched == 0
+          fail_msg: Unmanaged nonempty Oracle home. Use a new home or reconcile Oracle inventory ownership.
+        when: fr_installer.name == 'infrastructure' and not fr_installer_state.results[0].stat.exists
+      - name: Read completed installer identity
+        ansible.builtin.slurp:
+          src: '{{ fr_state }}/{{ fr_installer.name }}.complete'
+        register: fr_installer_marker
+        when: fr_installer_state.results[0].stat.exists
+      - name: Reject unmanaged partial or changed installations
+        ansible.builtin.assert:
+          that:
+          - not fr_installer_state.results[1].stat.exists or fr_installer_state.results[0].stat.exists
+          - not fr_installer_state.results[2].stat.exists or fr_installer_state.results[0].stat.exists
+          - not fr_installer_state.results[0].stat.exists or fr_installer_state.results[2].stat.exists
+          - not fr_installer_state.results[0].stat.exists or (fr_installer_marker.content | default('') | b64decode
+            | trim) == fr_installer_identity
+          fail_msg: '{{ fr_installer.name }} is unmanaged, incomplete, or its inputs changed. Reconcile inventory
+            and logs before retry.'
+      - name: Run silent installer
+        become_user: '{{ fr_os_user }}'
+        environment: '{{ fr_environment }}'
+        when: not fr_installer_state.results[0].stat.exists
+        block:
+        - name: Render Oracle installer response file
+          ansible.builtin.copy:
+            dest: '{{ fr_state }}/{{ fr_installer.name }}.rsp'
+            mode: '0600'
+            content: |
+              [ENGINE]
+              Response File Version=1.0.0.0.0
+              [GENERIC]
+              ORACLE_HOME={{ fr_oracle_home }}
+              INSTALL_TYPE={{ fr_installer.type }}
+              DECLINE_SECURITY_UPDATES=true
+              SECURITY_UPDATES_VIA_MYORACLESUPPORT=false
+        - name: Record installation start
+          ansible.builtin.copy:
+            dest: '{{ fr_state }}/{{ fr_installer.name }}.started'
+            content: |
+              {{ fr_installer_identity }}
+            mode: '0600'
+        - name: Execute Oracle silent installer
+          ansible.builtin.command:
+            argv: '{{ ([fr_java_home + ''/bin/java'', ''-jar'', fr_stage + ''/'' + fr_installer.file] if fr_installer.java
+              else [fr_stage + ''/'' + fr_installer.file, ''-jreLoc'', fr_java_home]) + [''-silent'', ''-responseFile'',
+              fr_state + ''/'' + fr_installer.name + ''.rsp'', ''-invPtrLoc'', fr_inventory_pointer] }}'
+            chdir: '{{ fr_stage }}'
+          async: '{{ fr_install_timeout | int }}'
+          poll: 15
+          register: fr_install_result
+          changed_when: true
+        - name: Save private installer output
+          ansible.builtin.copy:
+            dest: '{{ fr_log_home }}/{{ fr_installer.name }}-install.log'
+            content: |
+              {{ fr_install_result.stdout }}
+              {{ fr_install_result.stderr }}
+            mode: '0600'
+        - name: Verify installer artifact
+          ansible.builtin.stat:
+            path: '{{ fr_oracle_home }}/{{ fr_installer.probe }}'
+          register: fr_installed_probe
+        - name: Require installer completion artifact
+          ansible.builtin.assert:
+            that: fr_installed_probe.stat.exists
+        - name: Record completed installation
+          ansible.builtin.copy:
+            dest: '{{ fr_state }}/{{ fr_installer.name }}.complete'
+            content: |
+              {{ fr_installer_identity }}
+            mode: '0600'
+        - name: Remove installer start marker
+          ansible.builtin.file:
+            path: '{{ fr_state }}/{{ fr_installer.name }}.started'
+            state: absent
+      - name: Inspect Oracle inventory root script
+        ansible.builtin.stat:
+          path: '{{ fr_inventory_home }}/orainstRoot.sh'
+        register: fr_inventory_root_script
+      - name: Complete Oracle inventory root setup
+        ansible.builtin.command:
+          argv:
+          - /bin/sh
+          - '{{ fr_inventory_home }}/orainstRoot.sh'
+          creates: '{{ fr_state }}/inventory-root.complete'
+        when: fr_inventory_root_script.stat.exists
+        register: fr_inventory_root_result
+      - name: Record inventory root setup
+        ansible.builtin.copy:
+          dest: '{{ fr_state }}/inventory-root.complete'
+          content: |
+            Oracle inventory root script completed
+          owner: '{{ fr_os_user }}'
+          group: '{{ fr_os_group }}'
+          mode: '0600'
+        when: fr_inventory_root_script.stat.exists and fr_inventory_root_result is succeeded
+      when: fr_ohs_enabled | bool and fr_ohs_install_separately | bool
+    - name: Verify installed product templates
+      ansible.builtin.stat:
+        path: '{{ fr_oracle_home }}/{{ item }}'
+      register: fr_product_files
+      loop: '{{ [''oracle_common/common/bin/wlst.sh'', ''oracle_common/bin/rcu'', ''reports/common/templates/wls/oracle.reports_app_template.jar'',
+        ''ReportsToolsComponent/common/templates/wls/oracle.reports_tools_template.jar'', ''ReportsServerComponent/common/templates/wls/oracle.reports_server_template.jar'']
+        + ([''ohs/common/templates/wls/ohs_managed_template.jar''] if fr_ohs_enabled | bool else []) }}'
+    - name: Require complete requested product installation
+      ansible.builtin.assert:
+        that: item.stat.exists
+        fail_msg: Missing {{ item.item }}. Use a complete 14.1.2 distribution; OHS may need its separate installer.
+      loop: '{{ fr_product_files.results }}'
+      loop_control:
+        label: '{{ item.item }}'
+    - name: Write Oracle account environment
+      ansible.builtin.copy:
+        dest: '{{ fr_os_home }}/fr14_env.sh'
+        content: |
+          export JAVA_HOME='{{ fr_java_home }}'
+          export ORACLE_HOME='{{ fr_oracle_home }}'
+          export MW_HOME="$ORACLE_HOME"
+          export DOMAIN_HOME='{{ fr_domain_home }}'
+          export PATH="$JAVA_HOME/bin:$PATH"
+        owner: '{{ fr_os_user }}'
+        group: '{{ fr_os_group }}'
+        mode: '0600'
+    always:
+    - name: Release acquired deployment lock
+      ansible.builtin.file:
+        path: '{{ fr_state }}/deployment.lock'
+        state: absent
+      when: fr_lock is defined and fr_lock is succeeded and not ansible_check_mode

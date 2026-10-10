@@ -1,0 +1,166 @@
+---
+# Oracle Forms / Reports 14.1.2.0.0. All Linux paths are absolute, without spaces.
+# Target OS: Oracle Linux 8.6+ or 9.2+ x86_64, detected from Ansible facts.
+# Override individual keys in host_vars/<inventory-host>.yml or with -e @env.yml.
+fr_version: '14.1.2.0.0'
+fr_os_user: oracle
+fr_os_group: oinstall
+fr_os_home: /home/oracle
+fr_oracle_base: /u01/app/oracle
+fr_oracle_home: /u01/app/oracle/product/fr14
+fr_inventory_home: /u01/app/oraInventory
+fr_inventory_pointer: /etc/oraInst.loc
+fr_stage: /u01/stage/fr14
+fr_state: /u02/provisioning/fr14
+fr_domain_name: fr14_domain
+fr_domain_home: /u02/domains/fr14_domain
+fr_application_home: /u02/applications/fr14_domain
+fr_log_home: /u02/logs/fr14_domain
+
+# Supply licensed Oracle media. Full native FR distribution, including companion
+# files, must be extracted together. This procedure does not download from MOS.
+# target: media already staged on Linux; controller: copy files from controller.
+fr_media_location: target
+fr_controller_media_dir: /srv/oracle-media
+fr_media_companion_files: []
+# Example archive layout only: replace filename + directory with your certified
+# current Oracle JDK update. The archive must expand to fr_jdk_directory.
+fr_jdk_archive: jdk-17_linux-x64_bin.tar.gz
+fr_jdk_directory: jdk-17.0.12
+fr_java_parent: /u01/app/java
+fr_java_home: '{{ fr_java_parent }}/{{ fr_jdk_directory }}'
+fr_jdk_sha256: ''
+fr_infra_installer: fmw_14.1.2.0.0_infrastructure_generic.jar
+fr_infra_sha256: ''
+fr_forms_installer: fmw_14.1.2.0.0_fr_linux64.bin
+fr_forms_sha256: ''
+fr_infra_install_type: Fusion Middleware Infrastructure
+fr_forms_install_type: Forms and Reports Deployment
+
+# FR media can supply colocated OHS. Enable this only if your distribution needs
+# a separate, certified OHS installer in the same Oracle home.
+fr_ohs_enabled: true
+fr_ohs_install_separately: false
+fr_ohs_installer: fmw_14.1.2.0.0_ohs_linux64.bin
+fr_ohs_sha256: ''
+fr_ohs_install_type: Collocated HTTP Server (Managed through WebLogic server)
+fr_ohs_name: ohs1
+fr_ohs_port: 7777
+fr_ohs_ssl_port: 4443
+fr_ohs_admin_port: 9999
+fr_ohs_server_name: '{{ fr_listen_address }}'
+fr_proxy_timeout: 300
+
+fr_listen_address: '{{ ansible_fqdn }}'
+# Plain management endpoints are confined to this host; WLST runs on the target.
+fr_admin_address: 127.0.0.1
+fr_admin_port: 7001
+fr_admin_user: weblogic
+fr_nm_address: 127.0.0.1
+fr_nm_port: 5556
+fr_nm_user: nodemanager
+fr_machine_name: fr14_machine
+fr_forms_cluster: forms_cluster
+fr_reports_cluster: reports_cluster
+fr_forms_count: 2
+fr_reports_count: 2
+fr_forms_port_base: 9001
+fr_reports_port_base: 9101
+fr_forms_server_prefix: WLS_FORMS
+fr_reports_server_prefix: WLS_REPORTS
+fr_reports_tools_name: reptools1
+fr_reports_component_prefix: repsvr
+# Schema/template identifiers are explicit; do not substitute a 12c installer.
+fr_templates:
+  - Basic WebLogic Server Domain
+  - Oracle Forms
+  - Oracle Reports Application
+  - Oracle Reports Tools
+  - Oracle Reports Server
+fr_forms_server_groups: [FORMS-MAN-SVR]
+fr_reports_server_groups: [REPORTS-APP-SERVERS]
+
+# Repository database is an existing, certified Oracle database/PDB.
+fr_rcu_create: true
+fr_db_connect: db.example.com:1521/frpdb.example.com
+fr_db_jdbc_url: 'jdbc:oracle:thin:@//{{ fr_db_connect }}'
+fr_db_admin_user: SYS
+fr_db_admin_role: SYSDBA
+# Unique prefix for each independent domain; <= 12 uppercase alphanumerics.
+fr_rcu_prefix: FR14
+fr_rcu_components: [STB, OPSS, MDS, IAU, IAU_APPEND, IAU_VIEWER, WLS]
+
+# JVM values are MB. Include native Forms sessions + Reports engines in sizing.
+fr_admin_xms_mb: 1024
+fr_admin_xmx_mb: 2048
+fr_forms_xms_mb: 512
+fr_forms_xmx_mb: 1024
+fr_reports_xms_mb: 1024
+fr_reports_xmx_mb: 2048
+fr_jvm_common: '-XX:+UseG1GC -XX:+HeapDumpOnOutOfMemoryError -XX:+ExitOnOutOfMemoryError'
+fr_admin_jvm_extra: ''
+fr_forms_jvm_extra: ''
+fr_reports_jvm_extra: ''
+fr_reports_min_engine: 1
+fr_reports_init_engine: 1
+fr_reports_max_engine: 4
+fr_reports_engine_life: 50
+fr_reports_engine_max_idle: 15
+fr_reports_engine_jvm: '-Xms256m -Xmx1024m'
+
+# Minimum package versions and kernel certification still need site validation.
+# Required packages come from approved enabled repos (including devel/Motif).
+fr_os_packages:
+  - binutils
+  - gcc
+  - gcc-c++
+  - glibc
+  - glibc-devel
+  - libaio
+  - libaio-devel
+  - libgcc
+  - libstdc++
+  - libstdc++-devel
+  - libnsl
+  - sysstat
+  - motif
+  - motif-devel
+  - openssl
+  - openssl-libs
+  - make
+  - xorg-x11-utils
+  - ksh
+  - libcap
+  - libX11
+  - libXext
+  - libXt
+  - libXrender
+  - libXtst
+  - libXi
+  - libXau
+  - libxcb
+  - fontconfig
+  - freetype
+  - dejavu-sans-fonts
+  - unzip
+  - tar
+  - gzip
+  - procps-ng
+  - util-linux
+  - acl
+  - python3
+  - python3-lxml
+  - chrony
+fr_min_memory_mb: 16384
+fr_min_free_oracle_mb: 20480
+fr_min_free_domain_mb: 10240
+fr_nofile: 65536
+fr_nproc: 16384
+fr_tasks_max: 32768
+fr_start_timeout: 1200
+fr_stop_timeout: 300
+fr_install_timeout: 7200
+fr_sysctl:
+  fs.file-max: 2097152
+  net.core.somaxconn: 4096
+fr_manage_chrony: true
