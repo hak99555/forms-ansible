@@ -1,0 +1,26 @@
+[Unit]
+Description=Oracle per-domain Node Manager
+Wants=network-online.target
+After=network-online.target
+RequiresMountsFor=${ORACLE_HOME} ${DOMAIN_HOME} ${LOG_HOME}
+
+[Service]
+Type=simple
+User=${ORACLE_USER}
+Group=${ORACLE_GROUP}
+WorkingDirectory=${DOMAIN_HOME}
+ExecStart=/bin/bash ${SUITE_HOME}/service.sh nodemanager
+Restart=on-failure
+RestartSec=15
+TimeoutStopSec=${STOP_TIMEOUT}
+KillMode=control-group
+UMask=0077
+LimitNOFILE=${NOFILE_LIMIT}
+LimitNPROC=${NPROC_LIMIT}
+LimitCORE=0
+TasksMax=${TASKS_LIMIT}
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

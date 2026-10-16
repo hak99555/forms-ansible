@@ -1,0 +1,32 @@
+[Unit]
+Description=Oracle Forms and Reports domain
+Wants=network-online.target
+Requires=nodemanager.service
+After=network-online.target nodemanager.service
+RequiresMountsFor=${ORACLE_HOME} ${DOMAIN_HOME} ${APPLICATION_HOME} ${LOG_HOME}
+StartLimitIntervalSec=3600
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=${ORACLE_USER}
+Group=${ORACLE_GROUP}
+WorkingDirectory=${DOMAIN_HOME}
+ExecStart=/bin/bash ${SUITE_HOME}/service.sh admin
+ExecStartPost=/bin/bash ${SUITE_HOME}/service.sh start
+ExecStop=/bin/bash ${SUITE_HOME}/service.sh stop
+Restart=on-failure
+RestartSec=30
+TimeoutStartSec=${START_TIMEOUT}
+TimeoutStopSec=${TOTAL_STOP_TIMEOUT}
+KillMode=control-group
+UMask=0077
+LimitNOFILE=${NOFILE_LIMIT}
+LimitNPROC=${NPROC_LIMIT}
+LimitCORE=0
+TasksMax=${TASKS_LIMIT}
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
