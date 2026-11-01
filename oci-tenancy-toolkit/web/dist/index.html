@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="description" content="Explore OCI compartment hierarchies and search local inventory snapshots by OCID, resource type and name.">
+  <title>OCI Tenancy Explorer</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="core.js" defer></script><script src="demo.js" defer></script><script src="app.js" defer></script>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <a class="brand" href="#" aria-label="OCI Tenancy Explorer home"><span class="brand-icon">◈</span><span>TENANCY<span class="brand-sub">EXPLORER</span></span></a>
+    <div class="side-label">WORKSPACE</div><div class="side-link active"><span>▤</span> Resource explorer <span class="live-dot"></span></div>
+    <div class="sidebar-bottom"><span class="lock">▣</span><strong>Browser-local inventory</strong><p>Snapshots stay in this tab.<br>Optional in-memory collection.</p><span class="side-version">OCI ADMIN TOOLKIT / V1</span></div>
+  </aside>
+  <main>
+    <header class="topbar"><div class="crumb">Workspace <span>/</span> Resource explorer</div><span class="private-tag">● &nbsp; LOCAL PROCESSING</span></header>
+    <section class="page-head"><div><div class="eyebrow">ORACLE CLOUD INFRASTRUCTURE</div><h1>Your tenancy, mapped.</h1><p>Navigate compartments. Find the resource you need.</p></div><div class="head-actions"><button id="demo" class="button secondary">Load demo</button><button id="open-file" class="button secondary"><span>↥</span> Open snapshot</button><button id="collect-open" class="button primary">↻ Collect snapshot</button><input id="file" type="file" accept=".json,application/json" hidden></div></section>
+    <div id="message" class="message" role="status" hidden></div>
+    <section class="snapshot-bar"><div class="snapshot-icon">▧</div><div><strong id="tenancy-name">DemoTenancy</strong><span id="source-label">DEMO SNAPSHOT</span><div id="snapshot-date" class="muted"></div></div><div class="coverage-info" id="coverage"></div><button id="save-snapshot" class="text-button">Save snapshot</button></section>
+    <section class="stats" aria-label="Inventory totals"><div><span>RESOURCES</span><strong id="stat-resources">—</strong><small>in this snapshot</small></div><div><span>COMPARTMENTS</span><strong id="stat-compartments">—</strong><small>including tenancy root</small></div><div><span>REGIONS SCANNED</span><strong id="stat-regions">—</strong><small id="region-caption">from snapshot coverage</small></div><div><span>RESOURCE TYPES</span><strong id="stat-types">—</strong><small>discovered in inventory</small></div></section>
+    <section class="filters" aria-labelledby="filter-title"><div class="section-heading"><h2 id="filter-title">Find resources</h2><button id="clear" class="text-button">Reset filters</button></div><div class="filter-grid"><label class="wide">OCID <input id="ocid" placeholder="Paste an OCID or part of one…" autocomplete="off" spellcheck="false"></label><label>Name pattern <input id="name-pattern" placeholder="e.g. *finance* or erp-?" autocomplete="off"></label><label>Resource type <select id="kind"><option value="">All types</option></select></label><label>Region <select id="region"><option value="">All regions</option></select></label><label>State <select id="state"><option value="">All states</option></select></label></div><div class="filter-notes"><label class="checkbox"><input type="checkbox" id="exact"> Exact OCID match</label><span>Name: text contains · <code>*</code> any characters · <code>?</code> one character · case-insensitive</span></div></section>
+    <section class="explorer"><div class="tree-panel"><div class="panel-title"><h2>Compartment structure</h2><div><button class="icon-button" id="expand" title="Expand all compartments" aria-label="Expand all compartments">⊞</button><button class="icon-button" id="collapse" title="Collapse all compartments" aria-label="Collapse all compartments">⊟</button></div></div><div class="tree-caption">Counts include this node + all descendants.</div><button id="all-compartments" class="all-compartments">◈ &nbsp; Entire snapshot <span id="all-count"></span></button><div id="tree" class="tree" aria-label="Compartment hierarchy"></div><div class="tree-legend"><span class="legend-badge">2 / 5</span> matching / total resources in subtree</div></div>
+      <div class="results-panel"><div class="panel-title results-title"><div><h2 id="scope-name">Entire snapshot</h2><p id="result-summary" aria-live="polite"></p></div><button id="export" class="button small secondary">↓ Export JSON</button></div><div class="results-options"><span id="scope-path"></span><label class="checkbox"><input type="checkbox" id="descendants" checked> Include descendants</label></div><div class="table-scroll"><table><thead><tr><th><button data-sort="name">RESOURCE NAME <span>↕</span></button></th><th><button data-sort="kind">TYPE <span>↕</span></button></th><th><button data-sort="region">REGION <span>↕</span></button></th><th><button data-sort="state">STATE <span>↕</span></button></th><th aria-label="Open details"></th></tr></thead><tbody id="results"></tbody></table></div><div id="empty" class="empty" hidden><span>⌕</span><h3>No resources match</h3><p>Adjust the filters or search the entire snapshot.</p><button id="search-all" class="button secondary small">Search entire snapshot</button></div><footer class="pagination"><span id="page-info"></span><div><button id="previous" class="icon-button" aria-label="Previous page">←</button><button id="next" class="icon-button" aria-label="Next page">→</button></div></footer></div></section>
+    <footer class="page-footer"><span>Snapshot observations · ADB, OIC, buckets and other imported types</span><span id="freshness">Refresh inventory with the toolkit to see changes.</span></footer>
+  </main>
+</div>
+<dialog id="details"><div class="detail-head"><div><div class="eyebrow">RESOURCE DETAILS</div><h2 id="detail-name"></h2></div><button id="close-details" class="icon-button" aria-label="Close resource details">×</button></div><div id="detail-fields"></div><div class="detail-actions"><button id="copy-ocid" class="button secondary small">Copy OCID</button><button id="locate" class="button primary small">Show compartment</button></div><h3 class="raw-label">Collected metadata</h3><pre id="detail-json"></pre></dialog>
+<dialog id="collect-dialog"><div class="detail-head"><div><div class="eyebrow">READ-ONLY OCI COLLECTION</div><h2>Collect a fresh snapshot</h2></div><button id="collect-close" class="icon-button" aria-label="Close collection">×</button></div>
+  <p class="collect-intro">Credentials go only to this computer's loopback helper. A one-shot process signs OCI reads in memory, then exits. This app does not save the key, passphrase or credential fields.</p>
+  <div id="collect-status" class="message" role="status" hidden></div>
+  <form id="collect-form" autocomplete="off">
+    <fieldset id="collect-fields"><div class="credential-grid">
+      <label>Tenancy OCID<input id="cred-tenancy" required placeholder="ocid1.tenancy.…" autocomplete="off" spellcheck="false"></label>
+      <label>User OCID<input id="cred-user" required placeholder="ocid1.user.…" autocomplete="off" spellcheck="false"></label>
+      <label>API key fingerprint<input id="cred-fingerprint" required placeholder="aa:bb:cc:… (16 hex pairs)" autocomplete="off" spellcheck="false"></label>
+      <label>Private key PEM<textarea id="cred-key" required rows="4" placeholder="Paste the private PEM signing key here" autocomplete="off" spellcheck="false" autocapitalize="off" data-1p-ignore data-lpignore="true"></textarea></label>
+      <label>Key passphrase (if encrypted)<input id="cred-passphrase" type="password" autocomplete="off" data-1p-ignore data-lpignore="true"></label>
+      <label>Tenancy home region<input id="cred-home" required placeholder="ca-toronto-1" autocomplete="off" spellcheck="false"></label>
+      <label>Regions to scan<input id="cred-regions" required placeholder="ca-toronto-1, ca-montreal-1" autocomplete="off" spellcheck="false"></label>
+    </div><div class="collect-services"><strong>Services</strong><label class="checkbox"><input id="collect-adb" type="checkbox" checked> Autonomous Database</label><label class="checkbox"><input id="collect-oic" type="checkbox" checked> OIC</label><label class="checkbox"><input id="collect-buckets" type="checkbox" checked> Buckets</label></div>
+    <label class="checkbox collect-option"><input id="collect-bucket-details" type="checkbox" checked> Read bucket details</label>
+    <label class="checkbox collect-option"><input id="collect-identity" type="checkbox"> Include policies and Identity Domain groups</label>
+    <p class="collect-footnote">Scans root and all active compartments in the selected regions. IAM collection needs additional reader permissions. User memberships are not collected here. Any API error stops collection; your existing snapshot remains available.</p>
+    <button id="collect-submit" class="button primary" type="submit">Collect using these credentials</button></fieldset>
+  </form>
+  <p class="collect-footnote">Key fields clear as soon as collection starts. Each attempt needs credentials again. Avoid shared computers and untrusted extensions. The app cannot guarantee memory erasure from browser/OS internals. Only <b>Save snapshot</b> writes an inventory file, containing no credentials.</p>
+</dialog>
+</body>
+</html>

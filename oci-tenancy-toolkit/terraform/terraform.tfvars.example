@@ -1,0 +1,19 @@
+tenancy_ocid        = "ocid1.tenancy.oc1..REPLACE_ME"
+home_region         = "ca-toronto-1"
+region              = "ca-toronto-1"
+config_file_profile = "DEFAULT"
+auth                = "APIKey"
+
+# Empty means root and all active compartments. These are exact IDs, not subtrees.
+compartment_ids = []
+services        = ["adb", "oic", "buckets"]
+bucket_details  = true
+
+include_identity_domains = true
+# Limit SCIM calls to domains you can read; empty means all discovered active domains.
+domain_ids = []
+
+# Optional, exact userName values, including federated users synchronized into a domain.
+# user_queries = {
+#   "ocid1.domain.oc1..REPLACE_ME" = ["alice@example.com", "bob@example.com"]
+# }
